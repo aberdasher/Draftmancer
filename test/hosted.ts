@@ -108,7 +108,7 @@ describe("Hosted sessions", function () {
 		expect((await axios.put(`${base}/${spec.sessionID}`, spec, auth)).status).to.equal(200);
 		expect(Sessions[spec.sessionID]).to.equal(session);
 
-		const different = { ...spec, players: [...spec.players].reverse() };
+		const different = { ...spec, cubeCobraID: "another-cube" };
 		expect((await axios.put(`${base}/${spec.sessionID}`, different, auth)).status).to.equal(409);
 	});
 
@@ -437,6 +437,26 @@ describe("Hosted sessions", function () {
 
 				for (const players of [[], ["Alice", "Alice"], ["Alice", ""], "Alice"])
 					expect((await api("put", `${session.id}/players`, { players })).status).to.equal(400);
+			});
+
+			it("re-sending the original create after a players update leaves the players alone", async function () {
+				const spec = { ...makeSpec("hosted-players-resend"), players: ["Alice", "Bob"] };
+				expect((await axios.put(`${base}/${spec.sessionID}`, spec, auth)).status).to.equal(200);
+				const session = Sessions[spec.sessionID];
+				const alice = session.seats[0];
+				expect((await api("put", `${session.id}/players`, { players: ["Alice", "Carol"] })).status).to.equal(
+					200
+				);
+
+				const again = await axios.put(`${base}/${spec.sessionID}`, spec, auth);
+				expect(again.status).to.equal(200);
+				expect(again.data.result).to.equal("unchanged");
+				expect(Sessions[spec.sessionID]).to.equal(session);
+				expect(session.seats.map((s) => s.name)).to.deep.equal(["Alice", "Carol"]);
+				expect(session.seats[0]).to.equal(alice);
+
+				const different = { ...spec, settings: { ...spec.settings, pickTimer: 30 } };
+				expect((await axios.put(`${base}/${spec.sessionID}`, different, auth)).status).to.equal(409);
 			});
 
 			it("players and seating cannot change once the draft has started", async function () {

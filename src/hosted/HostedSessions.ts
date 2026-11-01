@@ -38,12 +38,19 @@ export function isSeatUserID(userID: string) {
 	return userID.startsWith(SeatUserIDPrefix);
 }
 
+/** Once created, the players route owns the player list: a re-sent create is judged on everything else. */
+function sameSession(session: Session, spec: HostedSessionSpec): boolean {
+	if (!session.hosted || !session.hostedSpec) return false;
+	const withoutPlayers = (s: HostedSessionSpec) => ({ ...s, players: [] });
+	return isDeepStrictEqual(withoutPlayers(session.hostedSpec), withoutPlayers(spec));
+}
+
 export async function createHostedSession(
 	spec: HostedSessionSpec,
 	fetchCube: CubeFetcher = cubeFetcher
 ): Promise<"created" | "unchanged" | "conflict"> {
 	const existing = Sessions[spec.sessionID];
-	if (existing) return existing.hosted && isDeepStrictEqual(existing.hostedSpec, spec) ? "unchanged" : "conflict";
+	if (existing) return sameSession(existing, spec) ? "unchanged" : "conflict";
 
 	const cube = await fetchCube(spec.cubeCobraID);
 	const cardList = convertCubeCobraList({ cubeID: spec.cubeCobraID, matchVersions: true }, cube);
@@ -51,7 +58,7 @@ export async function createHostedSession(
 
 	// Another request may have created it while the cube was downloading.
 	const raced = Sessions[spec.sessionID];
-	if (raced) return raced.hosted && isDeepStrictEqual(raced.hostedSpec, spec) ? "unchanged" : "conflict";
+	if (raced) return sameSession(raced, spec) ? "unchanged" : "conflict";
 
 	const s = spec.settings;
 	const session = new Session(spec.sessionID, undefined, {
