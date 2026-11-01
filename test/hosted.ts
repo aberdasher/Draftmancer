@@ -50,6 +50,7 @@ describe("Hosted sessions", function () {
 		setCubeFetcher(async () => fakeCube());
 	});
 	after(function () {
+		for (const id of Object.keys(Sessions)) if (Sessions[id].hosted) delete Sessions[id];
 		setCubeFetcher();
 	});
 
@@ -85,6 +86,7 @@ describe("Hosted sessions", function () {
 		expect(session.personalLogs).to.be.true;
 		expect(session.draftLogRecipients).to.equal("delayed");
 		expect(session.teamDraft).to.be.true;
+		expect(session.boostersPerPlayer).to.equal(3);
 		expect(session.maxTimer).to.equal(60);
 		expect(session.draftLogUnlockTimer).to.equal(30);
 		expect(session.useCustomCardList).to.be.true;
@@ -105,5 +107,16 @@ describe("Hosted sessions", function () {
 
 		const different = { ...spec, players: [...spec.players].reverse() };
 		expect((await axios.put(`${base}/${spec.sessionID}`, different, auth)).status).to.equal(409);
+	});
+
+	it("recreates a session that disappeared instead of claiming it is unchanged", async function () {
+		const spec = makeSpec("hosted-vanished");
+		expect((await axios.put(`${base}/${spec.sessionID}`, spec, auth)).status).to.equal(200);
+		delete Sessions[spec.sessionID];
+		expect((await axios.get(`${base}/${spec.sessionID}`, auth)).status).to.equal(404);
+		const again = await axios.put(`${base}/${spec.sessionID}`, spec, auth);
+		expect(again.status).to.equal(200);
+		expect(again.data.result).to.equal("created");
+		expect((await axios.get(`${base}/${spec.sessionID}`, auth)).status).to.equal(200);
 	});
 });

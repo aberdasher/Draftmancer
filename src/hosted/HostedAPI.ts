@@ -8,11 +8,7 @@ export function requireBearer(req: express.Request, res: express.Response, next:
 	const token = process.env.DRAFTBOT_API_TOKEN;
 	const header = req.headers.authorization ?? "";
 	const given = header.startsWith("Bearer ") ? header.slice(7) : "";
-	if (
-		token &&
-		given.length === token.length &&
-		timingSafeEqual(Buffer.from(given), Buffer.from(token))
-	)
+	if (token && given.length === token.length && timingSafeEqual(Buffer.from(given), Buffer.from(token)))
 		return next();
 	res.sendStatus(401);
 }

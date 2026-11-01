@@ -24,8 +24,6 @@ export function setCubeFetcher(fetcher?: CubeFetcher) {
 	cubeFetcher = fetcher ?? defaultCubeFetcher;
 }
 
-const specs = new Map<string, HostedSessionSpec>();
-
 export function seatUserID(sessionID: string, index: number) {
 	return `hosted-${sessionID}-${index}`;
 }
@@ -34,17 +32,16 @@ export async function createHostedSession(
 	spec: HostedSessionSpec,
 	fetchCube: CubeFetcher = cubeFetcher
 ): Promise<"created" | "unchanged" | "conflict"> {
-	const existing = specs.get(spec.sessionID);
-	if (existing) return isDeepStrictEqual(existing, spec) ? "unchanged" : "conflict";
-	if (spec.sessionID in Sessions) return "conflict";
+	const existing = Sessions[spec.sessionID];
+	if (existing) return existing.hosted && isDeepStrictEqual(existing.hostedSpec, spec) ? "unchanged" : "conflict";
 
 	const cube = await fetchCube(spec.cubeCobraID);
 	const cardList = convertCubeCobraList({ cubeID: spec.cubeCobraID, matchVersions: true }, cube);
 	if (isSocketError(cardList)) throw new Error(cardList.error?.title ?? "Invalid cube.");
 
 	// Another request may have created it while the cube was downloading.
-	const raced = specs.get(spec.sessionID);
-	if (raced || spec.sessionID in Sessions) return raced && isDeepStrictEqual(raced, spec) ? "unchanged" : "conflict";
+	const raced = Sessions[spec.sessionID];
+	if (raced) return raced.hosted && isDeepStrictEqual(raced.hostedSpec, spec) ? "unchanged" : "conflict";
 
 	const s = spec.settings;
 	const session = new Session(spec.sessionID, undefined, {
@@ -62,6 +59,10 @@ export async function createHostedSession(
 	});
 	session.setTeamDraft(s.teamDraft);
 	session.setCustomCardList(cardList);
+	// The list may carry its own settings; the requested ones win.
+	session.colorBalance = false;
+	session.setBoostersPerPlayer(s.boostersPerPlayer);
+	session.hostedSpec = structuredClone(spec);
 	session.seats = spec.players.map((name, i) => ({
 		name,
 		userID: seatUserID(spec.sessionID, i),
@@ -70,7 +71,6 @@ export async function createHostedSession(
 	}));
 
 	Sessions[spec.sessionID] = session;
-	specs.set(spec.sessionID, structuredClone(spec));
 	return "created";
 }
 

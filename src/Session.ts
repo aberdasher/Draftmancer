@@ -1,6 +1,6 @@
 import { assert } from "console";
 import { UserID, SessionID } from "./IDTypes.js";
-import type { HostedSeat } from "./hosted/types.js";
+import type { HostedSeat, HostedSessionSpec } from "./hosted/types.js";
 import {
 	shuffleArray,
 	getRandom,
@@ -143,6 +143,7 @@ export class Session implements IIndexable {
 	readonly managed: boolean = false;
 	readonly hosted: boolean = false; // Owner-less session controlled through the hosted API (src/hosted).
 	seats: HostedSeat[] = [];
+	hostedSpec?: HostedSessionSpec; // The spec this hosted session was created from.
 	userOrder: Array<string> = [];
 	users: Set<UserID> = new Set();
 	spectators: Set<UserID> = new Set();
