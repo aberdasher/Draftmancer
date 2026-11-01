@@ -10,6 +10,10 @@ import { Connections } from "../src/Connection.js";
 import { ReadyState } from "../src/Session/SessionTypes.js";
 import { isDraftState } from "../src/DraftState.js";
 import { connectClient, disableLogs, enableLogs, getUID } from "./src/common.js";
+import { dumpIntervalMs, dumpToDisk, loadFromDisk, startPeriodicDump } from "../src/Persistence.js";
+import fs from "fs";
+import os from "os";
+import path from "path";
 
 process.env.DRAFTBOT_API_TOKEN = "test-hosted-token";
 
@@ -512,6 +516,115 @@ describe("Hosted sessions", function () {
 				expect(session.users.has(bob)).to.be.true;
 				expect(bob in session.disconnectedUsers).to.be.false;
 				expect((await seatStatus(session.id))[1]).to.include({ connected: true, disconnectedSince: null });
+			});
+
+			describe("Restart", function () {
+				let dir: string;
+				beforeEach(function () {
+					dir = fs.mkdtempSync(path.join(os.tmpdir(), "hosted-persistence-"));
+				});
+				afterEach(function () {
+					fs.rmSync(dir, { recursive: true, force: true });
+				});
+
+				// A crash: the state on disk is all that survives; every socket is gone.
+				async function crashAndRestart(sessionID: string) {
+					dumpToDisk({ dir });
+					delete Sessions[sessionID];
+					for (const c of clients.splice(0)) c.disconnect();
+					await until(() => Object.keys(Connections).length === 0, "connections to close");
+					await loadFromDisk(dir);
+				}
+
+				it("a gathering hosted session survives restart", async function () {
+					const session = await hostedSession("hosted-restart-gathering", ["Alice", "Bob", "Carol"]);
+					await seatEveryone(session, ["Alice", "Bob"]);
+					const before = await seatStatus(session.id);
+
+					await crashAndRestart(session.id);
+
+					const restored = Sessions[session.id];
+					expect(restored).to.exist.and.not.equal(session);
+					expect(restored.hosted).to.be.true;
+					expect(restored.hostedSpec).to.deep.equal(session.hostedSpec);
+					const r = await axios.get(`${base}/${session.id}`, auth);
+					expect(r.status).to.equal(200);
+					expect(r.data.stage).to.equal("gathering");
+					const seats = r.data.seats as typeof before;
+					expect(seats.map((s) => [s.name, s.userID])).to.deep.equal(before.map((s) => [s.name, s.userID]));
+					for (const seat of seats) expect(seat).to.include({ connected: false, ready: "unknown" });
+					expect(seats[0].disconnectedSince).to.be.a("number");
+					expect(seats[2].disconnectedSince).to.be.null;
+
+					await seatEveryone(restored);
+					expect((await api("post", `${session.id}/start`)).status).to.equal(200);
+					expect(restored.getSortedHumanPlayersIDs()).to.deep.equal(seats.map((s) => s.userID));
+				});
+
+				it("a drafting hosted session restores and a player rejoins their seat", async function () {
+					const { session } = await startedSession("hosted-restart-drafting", ["Alice", "Bob"]);
+					const bob = session.seats[1].userID;
+
+					await crashAndRestart(session.id);
+
+					const status = await axios.get(`${base}/${session.id}`, auth);
+					expect(status.status).to.equal(200);
+					expect(status.data.stage).to.equal("drafting");
+					expect(status.data.seats.every((s: { connected: boolean }) => !s.connected)).to.be.true;
+
+					const back = connect(session.id, "Bob", "bobs-other-device");
+					let rejoined = false;
+					back.c.once("rejoinDraft", () => (rejoined = true));
+					await until(() => rejoined, "rejoinDraft");
+					const restored = Sessions[session.id];
+					expect(restored.drafting).to.be.true;
+					expect(restored.users.has(bob)).to.be.true;
+					expect((await seatStatus(session.id))[1]).to.include({ connected: true, disconnectedSince: null });
+				});
+
+				it("a hosted session waiting to send its logs still persists", async function () {
+					const session = await hostedSession("hosted-restart-logs", ["Alice"]);
+					session.initStableLogTimeout();
+					try {
+						await crashAndRestart(session.id);
+					} finally {
+						clearTimeout(session.stableLogTimeout);
+					}
+					expect((await axios.get(`${base}/${session.id}`, auth)).status).to.equal(200);
+				});
+
+				it("the periodic dump saves without disturbing the live draft", async function () {
+					const { session } = await startedSession("hosted-periodic", ["Alice", "Bob"]);
+					const draft = session.draftState;
+					if (!isDraftState(draft)) throw new Error("Expected a draft");
+					const players = Object.values(draft.players);
+					const live = players.map((p) => [p.botInstance, p.countdownInterval]);
+					const file = path.join(dir, "tmp", "sessions.json");
+					const timer = startPeriodicDump(20, dir);
+					try {
+						await until(() => fs.existsSync(file), "the first dump");
+						await new Promise((r) => setTimeout(r, 60));
+					} finally {
+						clearInterval(timer);
+					}
+					expect(live.every(([, countdown]) => countdown !== null)).to.be.true;
+					players.forEach((p, i) => {
+						expect(p.botInstance).to.equal(live[i][0]);
+						expect(p.countdownInterval).to.equal(live[i][1]);
+						expect(p.botPickInFlight).to.be.false;
+					});
+					expect(session.disconnectedUsers).to.deep.equal({});
+					expect(session.seats.every((s) => s.connected)).to.be.true;
+					const saved = JSON.parse(fs.readFileSync(file, "utf8")) as { id: string; seats: unknown }[];
+					expect(saved.find((s) => s.id === session.id)?.seats).to.deep.equal(session.seats);
+				});
+
+				it("the dump interval comes from HOSTED_DUMP_INTERVAL_MS, 30 s by default", function () {
+					expect(dumpIntervalMs({})).to.equal(30000);
+					expect(dumpIntervalMs({ HOSTED_DUMP_INTERVAL_MS: "5000" })).to.equal(5000);
+					for (const bad of ["", "0", "-1", "soon"])
+						expect(dumpIntervalMs({ HOSTED_DUMP_INTERVAL_MS: bad })).to.equal(30000);
+				});
 			});
 
 			it("nobody becomes owner when players leave", async function () {
