@@ -1590,10 +1590,8 @@ io.on("connection", async function (socket) {
 			return;
 		}
 		if (!socket.connected) return;
-		if (binding.userID !== query.userID) {
-			query.userID = binding.userID;
-			socket.emit("alreadyConnected", binding.userID);
-		}
+		query.userID = binding.userID;
+		socket.emit("hostedSeat", binding.userID);
 	} else if (isSeatUserID(query.userID)) {
 		query.userID = uuidv1();
 		socket.emit("alreadyConnected", query.userID);

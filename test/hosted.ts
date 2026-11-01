@@ -152,9 +152,16 @@ describe("Hosted sessions", function () {
 		function connect(sessionID: string, userName: string, userID?: string) {
 			const c = connectClient({ sessionID, userName, ...(userID ? { userID } : {}) });
 			const messages: { title: string; icon: string }[] = [];
+			const events = { hostedSeat: [] as string[], alreadyConnected: [] as string[] };
 			c.on("message", (m) => messages.push(m));
+			c.on("alreadyConnected", (id) => events.alreadyConnected.push(id));
+			// The test client adopts its seat ID the way the browser client does.
+			c.on("hostedSeat", (id) => {
+				events.hostedSeat.push(id);
+				(c as unknown as { query: Record<string, unknown> }).query.userID = id;
+			});
 			clients.push(c);
-			return { c, messages };
+			return { c, messages, events };
 		}
 
 		const userIDOf = (c: ReturnType<typeof connectClient>) => getUID(c) as string;
@@ -174,6 +181,16 @@ describe("Hosted sessions", function () {
 			expect(seats[0]).to.include({ name: "Alice", connected: true, disconnectedSince: null });
 			expect(seats[1].connected).to.be.false;
 			expect(session.users.size).to.equal(1);
+		});
+
+		it("sends the seat ID on hostedSeat, never alreadyConnected", async function () {
+			const session = await hostedSession("hosted-seat-event", ["Alice", "Bob"]);
+			const seat = session.seats[0];
+			const { events } = connect(session.id, "Alice", "alice-browser-id");
+			await until(() => session.users.has(seat.userID), "Alice to join");
+			await until(() => events.hostedSeat.length > 0, "the hostedSeat event");
+			expect(events.hostedSeat).to.deep.equal([seat.userID]);
+			expect(events.alreadyConnected).to.deep.equal([]);
 		});
 
 		it("refuses a second connection to a connected seat", async function () {

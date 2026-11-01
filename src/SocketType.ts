@@ -40,6 +40,7 @@ export interface ServerToClientEvents {
 	updatePublicSession: (data: { id: SessionID; isPrivate: true } | ReturnType<typeof getPublicSessionData>) => void;
 	publicSessions: (publicSessions: ReturnType<typeof getPublicSessionData>[]) => void;
 	alreadyConnected: (uid: UserID) => void;
+	hostedSeat: (uid: UserID) => void; // Hosted sessions: the userID of the seat this connection took.
 	stillAlive: (callback: () => void) => void;
 	setSession: (sid: SessionID) => void;
 	message: (msg: Message, pushToHistory?: boolean) => void;

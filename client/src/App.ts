@@ -338,6 +338,7 @@ export default defineComponent({
 
 			// Session status
 			managed: false, // Is the session managed by the server? (i.e. the session doesn't have an owner)
+			hostedSeat: false, // Is userID a hosted session's seat ID (see the hostedSeat event)?
 			sessionID: sessionID,
 			sessionOwner: (sessionID ? userID : undefined) as UserID | undefined,
 			sessionOwnerUsername: userName as string,
@@ -539,6 +540,14 @@ export default defineComponent({
 						"Multiple tabs open",
 						"Closing this tab after launching a draft will prevent you from reconnecting."
 					);
+			});
+
+			// Hosted sessions: the server bound us to our seat. The seat ID is only valid there, so it is not
+			// saved as this browser's userID (the seat link binds us again on any reconnect).
+			this.socket.on("hostedSeat", (seatUserID) => {
+				this.hostedSeat = true;
+				this.userID = seatUserID;
+				this.socket.io.opts.query!.userID = seatUserID;
 			});
 
 			this.socket.on("stillAlive", (ack) => {
@@ -1191,7 +1200,7 @@ export default defineComponent({
 
 			const startDraftSetup = (name = "draft", msg = "Draft Started!") => {
 				// Save user ID in case of disconnect
-				setCookie("userID", this.userID);
+				if (!this.hostedSeat) setCookie("userID", this.userID);
 
 				sessionStorage.setItem(
 					sessionStorageWindowSpecificDataKey,
