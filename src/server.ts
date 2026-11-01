@@ -77,6 +77,7 @@ import { convertCubeCobraList, DraftFormat, importFormat as convertDraftFormat }
 import { setBatchWindow } from "./bots/CubeCobraBots.js";
 import { MinesweeperDraftState } from "./MinesweeperDraft.js";
 import { registerHostedRoutes } from "./hosted/HostedAPI.js";
+import { bindHostedSeat, holdsSeat, isSeatUserID, SeatRefusals, setSeatConnected } from "./hosted/HostedSessions.js";
 
 if (process.env.NODE_ENV === "production") MTGOAPIInit();
 
@@ -1579,6 +1580,25 @@ io.on("connection", async function (socket) {
 			`${query.userName} [${query.userID}] connected. (${Object.keys(Connections).length + 1} players online)`
 		);
 
+	// Hosted sessions: the seat named by userName, not the browser's stored ID, is the identity.
+	const hostedSession = isString(query.sessionID) ? Sessions[query.sessionID] : undefined;
+	if (hostedSession?.hosted) {
+		const binding = await bindHostedSeat(hostedSession, query.userName, socket);
+		if (!binding.ok) {
+			socket.emit("message", new MessageError(...SeatRefusals[binding.reason]));
+			socket.disconnect(true);
+			return;
+		}
+		if (!socket.connected) return;
+		if (binding.userID !== query.userID) {
+			query.userID = binding.userID;
+			socket.emit("alreadyConnected", binding.userID);
+		}
+	} else if (isSeatUserID(query.userID)) {
+		query.userID = uuidv1();
+		socket.emit("alreadyConnected", query.userID);
+	}
+
 	if (query.userID in Connections) {
 		console.log(`${query.userName} [${query.userID}] already connected.`);
 		// For some reason sockets doesn't always cleanly disconnects.
@@ -1949,6 +1969,14 @@ function joinSession(sessionID: SessionID, userID: UserID, defaultSessionSetting
 
 	if (sessionID in Sessions) {
 		const sess = Sessions[sessionID];
+		if (sess.hosted) {
+			if (!holdsSeat(sess, userID)) return refuse(`This session (${sessionID}) only admits its listed players.`);
+			if (!sess.drafting) addUserToSession(userID, sessionID);
+			else if (userID in sess.disconnectedUsers) sess.reconnectUser(userID);
+			else if (!sess.users.has(userID)) return refuse(`This session (${sessionID}) is currently drafting.`);
+			setSeatConnected(sess, userID, true);
+			return;
+		}
 		// User was the owner, but not playing
 		if (userID === sess.owner && !sess.ownerIsPlayer) {
 			sess.reconnectOwner(userID);
@@ -2048,12 +2076,18 @@ function removeUserFromSession(sessionID: SessionID, userID: UserID) {
 		const sess = Sessions[sessionID];
 		if (sess.users.has(userID) || userID in sess.disconnectedUsers) {
 			sess.remUser(userID);
+			if (sess.hosted) setSeatConnected(sess, userID, false);
 			if (sess.isPublic) updatePublicSession(sessionID);
 
 			if (Connections[userID]) Connections[userID].sessionID = undefined;
 
 			//                           Keep session alive if the owner wasn't a player and is still connected.
-			if (sess.users.size === 0 && (sess.ownerIsPlayer || !(sess.owner && sess.owner in Connections))) {
+			// Hosted sessions outlive their players: their seats wait for them.
+			if (
+				sess.users.size === 0 &&
+				!sess.hosted &&
+				(sess.ownerIsPlayer || !(sess.owner && sess.owner in Connections))
+			) {
 				// If a game was going, we'll keep the session around for a while in case a player reconnects
 				// (mostly useful in case of disconnection during a single player game)
 				// Also keep it around if draft logs weren't unlocked, and scheduled to be automatically unlocked.
