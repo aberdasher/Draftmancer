@@ -543,7 +543,9 @@ export default defineComponent({
 			});
 
 			// Hosted sessions: the server bound us to our seat. The seat ID is only valid there, so it is not
-			// saved as this browser's userID (the seat link binds us again on any reconnect).
+			// saved as this browser's userID (the seat link binds us again on any reconnect). The server also uses this
+			// event to swap a seat ID left over from a session that is gone for a fresh ID, without the
+			// "Already connected" warning.
 			this.socket.on("hostedSeat", (seatUserID) => {
 				this.hostedSeat = true;
 				this.userID = seatUserID;

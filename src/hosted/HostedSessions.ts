@@ -46,12 +46,19 @@ function sameSession(session: Session, spec: HostedSessionSpec): boolean {
 	return isDeepStrictEqual(withoutPlayers(session.hostedSpec), withoutPlayers(spec));
 }
 
+/**
+ * Creates the hosted session `spec` describes. `isInactive` tells whether a session that is not live holds the ID
+ * (Persistence's InactiveSessions, passed in so this module does not import Persistence, which imports it).
+ */
 export async function createHostedSession(
 	spec: HostedSessionSpec,
+	isInactive: (sessionID: string) => boolean,
 	fetchCube: CubeFetcher = cubeFetcher
 ): Promise<"created" | "unchanged" | "conflict"> {
 	const existing = Sessions[spec.sessionID];
 	if (existing) return sameSession(existing, spec) ? "unchanged" : "conflict";
+	// An inactive session would be restored over this one by the first player joining its ID.
+	if (isInactive(spec.sessionID)) return "conflict";
 
 	const cube = await fetchCube(spec.cubeCobraID);
 	const cardList = convertCubeCobraList({ cubeID: spec.cubeCobraID, matchVersions: true }, cube);
@@ -60,6 +67,7 @@ export async function createHostedSession(
 	// Another request may have created it while the cube was downloading.
 	const raced = Sessions[spec.sessionID];
 	if (raced) return sameSession(raced, spec) ? "unchanged" : "conflict";
+	if (isInactive(spec.sessionID)) return "conflict";
 
 	const s = spec.settings;
 	const session = new Session(spec.sessionID, undefined, {
@@ -81,6 +89,7 @@ export async function createHostedSession(
 	session.colorBalance = false;
 	session.setBoostersPerPlayer(s.boostersPerPlayer);
 	session.hostedSpec = structuredClone(spec);
+	session.hostedCreatedAt = Date.now();
 	session.seats = spec.players.map((name, i) => ({
 		name,
 		userID: seatUserID(spec.sessionID, i),
@@ -90,6 +99,7 @@ export async function createHostedSession(
 	}));
 
 	Sessions[spec.sessionID] = session;
+	scheduleGatheringEnd(session);
 	return "created";
 }
 
@@ -300,6 +310,8 @@ export function startHostedDraft(session: Session): HostedRefusal | null {
 		return { status: 500, body: { error: "The session holds players without a seat." } };
 	const result = session.startDraft();
 	if (isSocketError(result)) return { status: 500, body: { error: result.error?.title ?? "Could not start." } };
+	// A started session is no longer idle; its lifetime starts again when the draft ends.
+	clearEndOfLife(session);
 	return null;
 }
 
@@ -327,6 +339,8 @@ export function resumeHostedDraft(session: Session): HostedRefusal | null {
  * a session whose draft never started is deleted, and anyone waiting in it is sent away.
  */
 export function stopHostedSession(session: Session): HostedRefusal | null {
+	// The draft only ends on the next tick: a second stop meanwhile must not end it again.
+	if (session.hostedStoppedAt !== null) return conflict("The draft was already stopped.");
 	if (session.drafting) {
 		// Persisted, so a scrapped draft is never mistaken for a finished one, even after a restart.
 		session.hostedStoppedAt = Date.now();
@@ -334,6 +348,12 @@ export function stopHostedSession(session: Session): HostedRefusal | null {
 		return null;
 	}
 	if (session.draftLog) return conflict("The draft has already ended.");
+	cancelGatheringSession(session);
+	return null;
+}
+
+/** Deletes a session whose draft never started and sends away anyone waiting in it. */
+function cancelGatheringSession(session: Session) {
 	deleteHostedSession(session);
 	for (const seat of session.seats) {
 		const connection = Connections[seat.userID];
@@ -341,7 +361,6 @@ export function stopHostedSession(session: Session): HostedRefusal | null {
 		connection.socket.emit("message", new MessageError("Draft cancelled", "This draft was cancelled."));
 		connection.socket.disconnect(true);
 	}
-	return null;
 }
 
 const draftEnded = (session: Session) => !session.drafting && session.draftLog !== undefined;
@@ -385,10 +404,24 @@ export function hostedLog(session: Session): DraftLog | undefined {
 	return { ...log, users };
 }
 
-/** HOSTED_ENDED_LIFETIME_MS when it is a positive number of milliseconds, 24 hours otherwise. */
+/** The longest delay setTimeout honours; a longer one fires at once. */
+export const MaxTimeoutMs = 2 ** 31 - 1;
+
+/** `env[name]` when it is a positive number of milliseconds, 24 hours otherwise; never more than MaxTimeoutMs. */
+function lifetimeMs(env: NodeJS.ProcessEnv, name: string): number {
+	const raw = env[name];
+	const ms = Number(raw);
+	return Math.min(raw && Number.isFinite(ms) && ms > 0 ? ms : 24 * 60 * 60 * 1000, MaxTimeoutMs);
+}
+
+/** How long an ended session is kept, from the end of its draft: HOSTED_ENDED_LIFETIME_MS, 24 hours by default. */
 export function endedSessionLifetimeMs(env: NodeJS.ProcessEnv = process.env): number {
-	const ms = Number(env.HOSTED_ENDED_LIFETIME_MS);
-	return env.HOSTED_ENDED_LIFETIME_MS && Number.isFinite(ms) && ms > 0 ? ms : 24 * 60 * 60 * 1000;
+	return lifetimeMs(env, "HOSTED_ENDED_LIFETIME_MS");
+}
+
+/** How long a session whose draft never starts is kept, from its creation: HOSTED_GATHERING_LIFETIME_MS, 24 h by default. */
+export function gatheringSessionLifetimeMs(env: NodeJS.ProcessEnv = process.env): number {
+	return lifetimeMs(env, "HOSTED_GATHERING_LIFETIME_MS");
 }
 
 let persistDeletion: () => void = () => {};
@@ -400,9 +433,22 @@ export function setDeletionPersister(persist?: () => void) {
 
 const endOfLifeTimers = new WeakMap<Session, NodeJS.Timeout>();
 
-export function deleteHostedSession(session: Session) {
+function clearEndOfLife(session: Session) {
 	clearTimeout(endOfLifeTimers.get(session));
 	endOfLifeTimers.delete(session);
+}
+
+/** Runs `end` once `since + lifetime` is reached (at once if it is past), replacing the session's previous timer. */
+function scheduleEndOfLifeAt(session: Session, since: number, lifetime: number, end: () => void) {
+	clearEndOfLife(session);
+	const remaining = Math.min(Math.max(0, since + lifetime - Date.now()), MaxTimeoutMs);
+	const timer = setTimeout(end, remaining);
+	timer.unref();
+	endOfLifeTimers.set(session, timer);
+}
+
+export function deleteHostedSession(session: Session) {
+	clearEndOfLife(session);
 	if (Sessions[session.id] !== session) return;
 	session.beforeDelete();
 	delete Sessions[session.id];
@@ -415,18 +461,32 @@ export function deleteHostedSession(session: Session) {
 
 /** Deletes an ended session once its lifetime, counted from the end of the draft, is over. */
 function scheduleEndOfLife(session: Session) {
-	clearTimeout(endOfLifeTimers.get(session));
-	const remaining = (session.hostedEndedAt ?? Date.now()) + endedSessionLifetimeMs() - Date.now();
-	const timer = setTimeout(() => deleteHostedSession(session), Math.max(0, remaining));
-	timer.unref();
-	endOfLifeTimers.set(session, timer);
+	scheduleEndOfLifeAt(session, session.hostedEndedAt ?? Date.now(), endedSessionLifetimeMs(), () =>
+		deleteHostedSession(session)
+	);
 }
 
-/** A restored session whose draft had ended keeps the lifetime it had; the reconciler can still pull its log. */
+const gathering = (session: Session) => !session.drafting && !session.draftLog;
+
+/** Cancels a session whose draft has not started once its lifetime, counted from its creation, is over. */
+function scheduleGatheringEnd(session: Session) {
+	scheduleEndOfLifeAt(session, session.hostedCreatedAt ?? Date.now(), gatheringSessionLifetimeMs(), () => {
+		if (gathering(session)) cancelGatheringSession(session);
+	});
+}
+
+/**
+ * A restored session keeps the lifetime it had: an ended one counted from the end of its draft (the reconciler can
+ * still pull its log), a gathering one from its creation.
+ */
 export function onHostedSessionRestored(session: Session) {
-	if (!draftEnded(session)) return;
-	session.hostedEndedAt ??= Date.now();
-	scheduleEndOfLife(session);
+	if (draftEnded(session)) {
+		session.hostedEndedAt ??= Date.now();
+		scheduleEndOfLife(session);
+	} else if (gathering(session)) {
+		session.hostedCreatedAt ??= Date.now();
+		scheduleGatheringEnd(session);
+	}
 }
 
 export type Wait = (ms: number) => Promise<void>;

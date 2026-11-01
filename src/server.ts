@@ -24,7 +24,14 @@ import {
 	MessageError,
 } from "./Message.js";
 import { Constants } from "./Constants.js";
-import { InactiveConnections, InactiveSessions, restoreSession, getPoDSession, copyPODProps } from "./Persistence.js";
+import {
+	InactiveConnections,
+	InactiveSessions,
+	restoreSession,
+	getPoDSession,
+	copyPODProps,
+	restoreHostedSessions,
+} from "./Persistence.js";
 import { Connection, Connections } from "./Connection.js";
 import { DistributionMode, DraftLogRecipients, ReadyState } from "./Session/SessionTypes";
 import { Session, Sessions, getPublicSessionData } from "./Session.js";
@@ -1601,8 +1608,9 @@ io.on("connection", async function (socket) {
 		query.userID = binding.userID;
 		socket.emit("hostedSeat", binding.userID);
 	} else if (isSeatUserID(query.userID)) {
+		// A seat ID from a session that is gone (e.g. a reload after it was deleted): silently swap it for a fresh one.
 		query.userID = uuidv1();
-		socket.emit("alreadyConnected", query.userID);
+		socket.emit("hostedSeat", query.userID);
 	}
 
 	if (query.userID in Connections) {
@@ -2405,6 +2413,9 @@ app.post("/setBotBatchWindow", requirePOSTAPIKey, (req, res) => {
 registerHostedRoutes(app);
 
 Promise.all([InactiveConnections, InactiveSessions]).then(() => {
+	// Here, not in Persistence.ts's own load: restoring constructs Sessions, and Session.ts and Persistence.ts import
+	// each other, so Session is only certain to be initialised once every module has been evaluated.
+	restoreHostedSessions();
 	httpServer.listen(DraftmancerPort, () => {
 		console.log(`Listening on port ${DraftmancerPort} (ready in ${process.uptime().toFixed(2)}s)`);
 	});

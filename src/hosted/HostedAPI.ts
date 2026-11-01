@@ -1,6 +1,7 @@
 import express from "express";
 import { timingSafeEqual } from "node:crypto";
 import { Session, Sessions } from "../Session.js";
+import { InactiveSessions } from "../Persistence.js";
 import {
 	createHostedSession,
 	HostedRefusal,
@@ -36,7 +37,9 @@ function parseSpec(id: string, body: unknown): HostedSessionSpec | null {
 	const b = body as Record<string, unknown>;
 	const s = b.settings as Record<string, unknown> | undefined;
 	if (b.sessionID !== id) return null;
+	// An empty list is allowed (the players route fills it); a repeated name would leave both seats unbindable.
 	if (!Array.isArray(b.players) || !b.players.every((p) => typeof p === "string" && p !== "")) return null;
+	if (new Set(b.players).size !== b.players.length) return null;
 	if (typeof b.cubeCobraID !== "string" || b.cubeCobraID === "") return null;
 	if (b.logWebhook !== null && typeof b.logWebhook !== "string") return null;
 	if (typeof s !== "object" || s === null || typeof s.teamDraft !== "boolean") return null;
@@ -69,7 +72,7 @@ export function registerHostedRoutes(app: express.Express): void {
 		const spec = parseSpec(String(req.params.id), req.body);
 		if (!spec) return void res.status(400).json({ error: "Invalid hosted session spec." });
 		try {
-			const result = await createHostedSession(spec);
+			const result = await createHostedSession(spec, (id) => id in InactiveSessions);
 			if (result === "conflict") return void res.status(409).json({ error: "A different session exists." });
 			res.status(200).json({ result });
 		} catch (e) {

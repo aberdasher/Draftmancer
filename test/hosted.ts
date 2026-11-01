@@ -6,16 +6,27 @@ import { Sessions } from "../src/Session.js";
 import { DraftmancerPort } from "../src/server.js";
 import {
 	endedSessionLifetimeMs,
+	gatheringSessionLifetimeMs,
+	MaxTimeoutMs,
 	setCubeFetcher,
 	setDeletionPersister,
 	setLogPushWait,
+	stopHostedSession,
 } from "../src/hosted/HostedSessions.js";
 import type { HostedSessionSpec } from "../src/hosted/types.js";
 import { Connections } from "../src/Connection.js";
 import { ReadyState } from "../src/Session/SessionTypes.js";
 import { isDraftState } from "../src/DraftState.js";
 import { connectClient, disableLogs, enableLogs, getUID } from "./src/common.js";
-import { dumpIntervalMs, dumpToDisk, loadFromDisk, startPeriodicDump } from "../src/Persistence.js";
+import {
+	dumpIntervalMs,
+	dumpToDisk,
+	InactiveSessions,
+	loadFromDisk,
+	restoreHostedSessions,
+	setDumpWriter,
+	startPeriodicDump,
+} from "../src/Persistence.js";
 import type { DraftLog } from "../src/DraftLog.js";
 import express from "express";
 import type { AddressInfo } from "net";
@@ -123,6 +134,26 @@ describe("Hosted sessions", function () {
 
 		const different = { ...spec, cubeCobraID: "another-cube" };
 		expect((await axios.put(`${base}/${spec.sessionID}`, different, auth)).status).to.equal(409);
+	});
+
+	it("refuses a create naming a seat twice; an empty player list is fine", async function () {
+		const twice = { ...makeSpec("hosted-name-twice"), players: ["Alice", "Bob", "Alice"] };
+		expect((await axios.put(`${base}/${twice.sessionID}`, twice, auth)).status).to.equal(400);
+		expect(twice.sessionID in Sessions).to.be.false;
+		const empty = { ...makeSpec("hosted-no-players"), players: [] };
+		expect((await axios.put(`${base}/${empty.sessionID}`, empty, auth)).status).to.equal(200);
+		expect(Sessions[empty.sessionID].seats).to.deep.equal([]);
+	});
+
+	it("an ID held by an inactive session is a conflict", async function () {
+		const spec = makeSpec("hosted-inactive-held");
+		InactiveSessions[spec.sessionID] = { id: spec.sessionID, hosted: false };
+		try {
+			expect((await axios.put(`${base}/${spec.sessionID}`, spec, auth)).status).to.equal(409);
+			expect(spec.sessionID in Sessions).to.be.false;
+		} finally {
+			delete InactiveSessions[spec.sessionID];
+		}
 	});
 
 	it("recreates a session that disappeared instead of claiming it is unchanged", async function () {
@@ -297,6 +328,22 @@ describe("Hosted sessions", function () {
 			await until(() => messages.some((m) => m.icon === "error"), "a refusal");
 			expect(messages.find((m) => m.icon === "error")!.title).to.equal("No seat for this name");
 			expect(session.users.size).to.equal(0);
+		});
+
+		it("a seat ID from a deleted hosted session is swapped on hostedSeat, without alreadyConnected", async function () {
+			const session = await hostedSession("hosted-seat-stale", ["Alice", "Bob"]);
+			const seatID = session.seats[0].userID;
+			expect((await axios.post(`${base}/${session.id}/stop`, undefined, auth)).status).to.equal(200);
+			expect(session.id in Sessions).to.be.false;
+			// A reload of a tab that held the seat: the browser still presents the seat's ID.
+			const { c, events } = connect(session.id, "Alice", seatID);
+			await until(() => events.hostedSeat.length > 0, "the hostedSeat event");
+			await until(() => userIDOf(c) in Connections, "the connection");
+			const [fresh] = events.hostedSeat;
+			expect(fresh).to.not.equal(seatID);
+			expect(fresh.startsWith("hosted-")).to.be.false;
+			expect(userIDOf(c)).to.equal(fresh);
+			expect(events.alreadyConnected).to.deep.equal([]);
 		});
 
 		it("seat IDs only bind through their hosted session", async function () {
@@ -547,6 +594,7 @@ describe("Hosted sessions", function () {
 					for (const c of clients.splice(0)) c.disconnect();
 					await until(() => Object.keys(Connections).length === 0, "connections to close");
 					await loadFromDisk(dir);
+					restoreHostedSessions();
 				}
 
 				it("a gathering hosted session survives restart", async function () {
@@ -678,7 +726,74 @@ describe("Hosted sessions", function () {
 						setDeletionPersister();
 					}
 					await loadFromDisk(dir);
+					restoreHostedSessions();
 					expect(session.id in Sessions).to.be.false;
+				});
+
+				it("a failed dump keeps the last good copy and closes its files", async function () {
+					const session = await hostedSession("hosted-dump-fails", ["Alice", "Bob"]);
+					const file = path.join(dir, "tmp", "sessions.json");
+					dumpToDisk({ dir });
+					const good = fs.readFileSync(file, "utf8");
+					expect(good).to.include(session.id);
+					const openFiles = () => fs.readdirSync("/proc/self/fd").length;
+					const before = openFiles();
+					delete Sessions[session.id];
+					setDumpWriter(() => {
+						throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+					});
+					try {
+						for (let i = 0; i < 20; ++i) expect(() => dumpToDisk({ dir })).to.throw(/ENOSPC/);
+					} finally {
+						setDumpWriter();
+					}
+					expect(openFiles()).to.be.at.most(before);
+					expect(fs.readFileSync(file, "utf8")).to.equal(good);
+					// The disk recovers: the next dump goes through.
+					dumpToDisk({ dir });
+					expect(fs.readFileSync(file, "utf8")).to.not.include(session.id);
+				});
+
+				it("a session restore that fails leaves the others restored and its saved copy in place", async function () {
+					const ok = await hostedSession("hosted-restore-ok", ["Alice"]);
+					await hostedSession("hosted-restore-broken", ["Bob"]);
+					// A saved copy whose restore throws (seats is not iterable).
+					Sessions["hosted-restore-broken"].seats = 42 as unknown as [];
+					dumpToDisk({ dir });
+					delete Sessions["hosted-restore-broken"];
+					delete Sessions[ok.id];
+					await loadFromDisk(dir);
+					try {
+						restoreHostedSessions();
+						expect(Sessions[ok.id]?.hosted).to.be.true;
+						expect("hosted-restore-broken" in Sessions).to.be.false;
+						expect("hosted-restore-broken" in InactiveSessions).to.be.true;
+						expect(ok.id in InactiveSessions).to.be.false;
+					} finally {
+						delete InactiveSessions["hosted-restore-broken"];
+					}
+				});
+
+				it("a gathering session restored after a crash keeps the idle lifetime it had", async function () {
+					const session = await hostedSession("hosted-restart-idle", ["Alice", "Bob"]);
+					const createdAt = session.hostedCreatedAt;
+					expect(createdAt).to.be.a("number");
+					await seatEveryone(session, ["Alice"]);
+
+					await crashAndRestart(session.id);
+					const restored = Sessions[session.id];
+					expect(restored).to.exist.and.not.equal(session);
+					expect(restored.hostedCreatedAt).to.equal(createdAt);
+
+					// The lifetime counts from the creation of the session, not from the restart.
+					process.env.HOSTED_GATHERING_LIFETIME_MS = String(Date.now() - createdAt! + 300);
+					try {
+						await crashAndRestart(session.id);
+						expect(session.id in Sessions).to.be.true;
+						await until(() => !(session.id in Sessions), "the restored session to be deleted");
+					} finally {
+						delete process.env.HOSTED_GATHERING_LIFETIME_MS;
+					}
 				});
 
 				it("the dump interval comes from HOSTED_DUMP_INTERVAL_MS, 30 s by default", function () {
@@ -723,6 +838,7 @@ describe("Hosted sessions", function () {
 				});
 				afterEach(function () {
 					delete process.env.HOSTED_ENDED_LIFETIME_MS;
+					delete process.env.HOSTED_GATHERING_LIFETIME_MS;
 				});
 
 				const getLog = (sessionID: string) => axios.get(`${base}/${sessionID}/log`, auth);
@@ -900,6 +1016,25 @@ describe("Hosted sessions", function () {
 					expect((await api("post", `${session.id}/stop`)).status).to.equal(409);
 				});
 
+				it("a second stop before the draft has ended is refused", async function () {
+					const { session } = await startedSession("hosted-stop-twice", ["Alice", "Bob"], {
+						logWebhook: hookURL,
+					});
+					let ended = 0;
+					const endDraft = session.endDraft.bind(session);
+					session.endDraft = () => {
+						++ended;
+						endDraft();
+					};
+					expect(stopHostedSession(session)).to.be.null;
+					expect(session.drafting).to.be.true; // The draft only ends on the next tick.
+					expect(stopHostedSession(session)?.status).to.equal(409);
+					await until(() => !session.drafting, "the draft to stop");
+					await settle();
+					expect(ended).to.equal(1);
+					expect((await api("post", `${session.id}/stop`)).status).to.equal(409);
+				});
+
 				it("stop before the draft starts deletes the session", async function () {
 					const session = await hostedSession("hosted-stop-gathering", ["Alice", "Bob"]);
 					const { Alice } = await seatEveryone(session, ["Alice"]);
@@ -926,6 +1061,36 @@ describe("Hosted sessions", function () {
 					expect(endedSessionLifetimeMs({ HOSTED_ENDED_LIFETIME_MS: "5000" })).to.equal(5000);
 					for (const bad of ["", "0", "-1", "later"])
 						expect(endedSessionLifetimeMs({ HOSTED_ENDED_LIFETIME_MS: bad })).to.equal(day);
+					// setTimeout fires at once beyond 2^31-1 ms.
+					expect(MaxTimeoutMs).to.equal(2 ** 31 - 1);
+					expect(endedSessionLifetimeMs({ HOSTED_ENDED_LIFETIME_MS: "1e12" })).to.equal(MaxTimeoutMs);
+				});
+
+				it("the idle lifetime comes from HOSTED_GATHERING_LIFETIME_MS, 24 h by default", function () {
+					const day = 24 * 60 * 60 * 1000;
+					expect(gatheringSessionLifetimeMs({})).to.equal(day);
+					expect(gatheringSessionLifetimeMs({ HOSTED_GATHERING_LIFETIME_MS: "5000" })).to.equal(5000);
+					for (const bad of ["", "0", "-1", "later"])
+						expect(gatheringSessionLifetimeMs({ HOSTED_GATHERING_LIFETIME_MS: bad })).to.equal(day);
+					expect(gatheringSessionLifetimeMs({ HOSTED_GATHERING_LIFETIME_MS: "1e12" })).to.equal(MaxTimeoutMs);
+				});
+
+				it("a session whose draft never starts is deleted after its idle lifetime", async function () {
+					process.env.HOSTED_GATHERING_LIFETIME_MS = "300";
+					const session = await hostedSession("hosted-idle", ["Alice", "Bob"]);
+					const { Alice } = await seatEveryone(session, ["Alice"]);
+					await until(() => !(session.id in Sessions), "the idle session to be deleted");
+					expect((await axios.get(`${base}/${session.id}`, auth)).status).to.equal(404);
+					await until(() => !Alice.c.connected, "Alice to be sent away");
+					expect(Alice.messages.some((m) => m.title === "Draft cancelled")).to.be.true;
+				});
+
+				it("a started draft outlives the idle lifetime", async function () {
+					process.env.HOSTED_GATHERING_LIFETIME_MS = "1500";
+					const { session } = await startedSession("hosted-idle-started", ["Alice", "Bob"]);
+					await new Promise((r) => setTimeout(r, session.hostedCreatedAt! + 1700 - Date.now()));
+					expect(Sessions[session.id]).to.equal(session);
+					expect(session.drafting).to.be.true;
 				});
 
 				it("removes an unexpected user", async function () {
