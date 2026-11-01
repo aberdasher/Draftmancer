@@ -98,7 +98,13 @@ export function hostedStatus(id: string): HostedStatus | null {
 	if (!session?.hosted) return null;
 	return {
 		sessionID: id,
-		stage: session.drafting ? "drafting" : session.draftLog ? "ended" : "gathering",
+		stage: session.drafting
+			? "drafting"
+			: session.hostedStoppedAt !== null
+				? "stopped"
+				: session.draftLog
+					? "ended"
+					: "gathering",
 		seats: session.seats,
 		pickNumber: null,
 	};
@@ -316,16 +322,14 @@ export function resumeHostedDraft(session: Session): HostedRefusal | null {
 	return null;
 }
 
-// Drafts ended by `stop` rather than played out: their log is not pushed.
-const stoppedDrafts = new WeakSet<Session>();
-
 /**
- * Stops the session: a running draft ends at once (its log is kept but not pushed, as the draft did not finish);
+ * Stops the session: a running draft ends at once and is marked stopped (its log is neither pushed nor served);
  * a session whose draft never started is deleted, and anyone waiting in it is sent away.
  */
 export function stopHostedSession(session: Session): HostedRefusal | null {
 	if (session.drafting) {
-		stoppedDrafts.add(session);
+		// Persisted, so a scrapped draft is never mistaken for a finished one, even after a restart.
+		session.hostedStoppedAt = Date.now();
 		session.stopDraft();
 		return null;
 	}
@@ -468,17 +472,16 @@ export async function pushHostedLog(url: string, sessionID: string, log: DraftLo
 
 /**
  * Called by Session.endDraft once the draft has ended: starts the session's lifetime and pushes the full log to the
- * session's webhook; a delivered log ends the session at once.
+ * session's webhook, unless the draft was stopped. Delivery does not end the session: players keep building and
+ * exporting decks in it, so only its lifetime does.
  */
 export function onHostedDraftEnded(session: Session): void {
 	session.hostedEndedAt = Date.now();
 	scheduleEndOfLife(session);
 	const url = session.hostedSpec?.logWebhook;
 	const log = hostedLog(session);
-	if (!url || !log || stoppedDrafts.has(session)) return;
-	void pushHostedLog(url, session.id, log).then((delivered) => {
-		if (delivered) deleteHostedSession(session);
-	});
+	if (!url || !log || session.hostedStoppedAt !== null) return;
+	void pushHostedLog(url, session.id, log);
 }
 
 export const SeatRefusals: Record<"seat-in-use" | "no-such-seat", [title: string, text: string]> = {

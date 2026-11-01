@@ -146,6 +146,7 @@ export class Session implements IIndexable {
 	seats: HostedSeat[] = [];
 	hostedSpec?: HostedSessionSpec; // The spec this hosted session was created from.
 	hostedEndedAt: number | null = null; // Epoch ms at which the hosted draft ended.
+	hostedStoppedAt: number | null = null; // Epoch ms at which the hosted API stopped the draft before it finished.
 	userOrder: Array<string> = [];
 	users: Set<UserID> = new Set();
 	spectators: Set<UserID> = new Set();

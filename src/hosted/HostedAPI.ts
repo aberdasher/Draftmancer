@@ -128,9 +128,11 @@ export function registerHostedRoutes(app: express.Express): void {
 		onSession((session, req) => removeHostedUser(session, String(req.params.userID)))
 	);
 
-	// The full log, even while it is locked for the players; 404 until the draft ends.
+	// The full log, even while it is locked for the players; 404 until the draft ends, 410 for a stopped draft.
 	app.get("/api/hosted/sessions/:id/log", requireBearer, (req, res) => {
 		const session = Sessions[String(req.params.id)];
+		if (session?.hosted && session.hostedStoppedAt !== null && !session.drafting)
+			return void res.status(410).json({ error: "The draft was stopped before it finished." });
 		const log = session?.hosted ? hostedLog(session) : undefined;
 		if (!log) return void res.sendStatus(404);
 		res.json(log);

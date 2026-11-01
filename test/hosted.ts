@@ -655,6 +655,19 @@ describe("Hosted sessions", function () {
 					}
 				});
 
+				it("a stopped draft stays stopped after a restart", async function () {
+					const { session } = await startedSession("hosted-restart-stopped", ["Alice", "Bob"]);
+					expect((await api("post", `${session.id}/stop`)).status).to.equal(200);
+					await until(() => !session.drafting, "the draft to stop");
+
+					await crashAndRestart(session.id);
+					const restored = Sessions[session.id];
+					expect(restored).to.exist.and.not.equal(session);
+					expect(restored.hostedStoppedAt).to.equal(session.hostedStoppedAt);
+					expect((await axios.get(`${base}/${session.id}`, auth)).data.stage).to.equal("stopped");
+					expect((await axios.get(`${base}/${session.id}/log`, auth)).status).to.equal(410);
+				});
+
 				it("a deleted session does not come back on restart", async function () {
 					const session = await hostedSession("hosted-restart-deleted", ["Alice", "Bob"]);
 					dumpToDisk({ dir });
@@ -742,9 +755,10 @@ describe("Hosted sessions", function () {
 					expect(body.log.boosters.length).to.be.above(0);
 					expect(waits).to.deep.equal([]);
 
-					// Delivered: the session has done its job and goes away.
-					await until(() => !(session.id in Sessions), "the session to be deleted");
-					expect((await getLog(session.id)).status).to.equal(404);
+					// Delivered, yet players keep building and exporting decks in the session.
+					await settle();
+					expect(Sessions[session.id]).to.equal(session);
+					expect((await getLog(session.id)).status).to.equal(200);
 				});
 
 				it("the push retries when the webhook fails", async function () {
@@ -758,7 +772,8 @@ describe("Hosted sessions", function () {
 					expect(pushes).to.have.length(3);
 					expect(waits).to.deep.equal([2000, 4000]);
 					expect(new Set(pushes.map((p) => JSON.stringify(p.body))).size).to.equal(1);
-					await until(() => !(session.id in Sessions), "the session to be deleted");
+					expect(Sessions[session.id]).to.equal(session);
+					expect((await getLog(session.id)).status).to.equal(200);
 				});
 
 				it("the push gives up after five attempts and keeps the log fetchable", async function () {
@@ -877,8 +892,9 @@ describe("Hosted sessions", function () {
 					await until(() => !session.drafting, "the draft to stop");
 					await settle();
 					const status = await axios.get(`${base}/${session.id}`, auth);
-					expect(status.data.stage).to.equal("ended");
-					expect((await getLog(session.id)).status).to.equal(200);
+					expect(status.data.stage).to.equal("stopped");
+					expect((await getLog(session.id)).status).to.equal(410);
+					expect(session.hostedStoppedAt).to.be.a("number");
 					// A stopped draft is not a finished one: DraftBot is not sent its log.
 					expect(pushes).to.deep.equal([]);
 					expect((await api("post", `${session.id}/stop`)).status).to.equal(409);

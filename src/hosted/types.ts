@@ -27,7 +27,7 @@ export type HostedSessionSpec = {
 
 export type HostedStatus = {
 	sessionID: string;
-	stage: "gathering" | "drafting" | "ended";
+	stage: "gathering" | "drafting" | "ended" | "stopped";
 	seats: HostedSeat[];
 	pickNumber: number | null;
 };
