@@ -1,0 +1,50 @@
+# Draftmancer with hosted sessions, reachable only over the tailnet.
+#
+# The droplet's nginx serves https://draft.draftbot.fyi and proxies to this node's
+# tailnet name on port 8080; DraftBot reaches the control API (/api/hosted/) the same
+# way. Nothing here is published on the host's own interfaces.
+#
+# Same sidecar pattern as the DraftBot test bot: the tailscale container owns the
+# network namespace and runs tailscaled directly (no auth key stored). Log it in once:
+#   docker exec draftmancer-tailscale tailscale up --hostname=draftmancer
+# and the state volume keeps the node across restarts.
+#
+# Secrets live in hosted.env next to this file (not committed): DRAFTBOT_API_TOKEN=...
+
+services:
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: draftmancer-tailscale
+    network_mode: bridge
+    command:
+      - /usr/local/bin/tailscaled
+      - --state=/var/lib/tailscale/tailscaled.state
+      - --socket=/var/run/tailscale/tailscaled.sock
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+    restart: unless-stopped
+
+  draftmancer:
+    image: draftmancer-hosted:${DRAFTMANCER_TAG:-latest}
+    container_name: draftmancer
+    network_mode: "container:draftmancer-tailscale"
+    depends_on:
+      - tailscale
+    env_file:
+      - hosted.env
+    environment:
+      NODE_ENV: production
+      # Saved sessions survive a container restart; /home/node is the image user's home.
+      PERSISTENCE_LOCAL_PATH: /home/node/persist
+    volumes:
+      - draftmancer-persist:/home/node/persist
+    restart: unless-stopped
+
+volumes:
+  tailscale-state:
+  draftmancer-persist:
