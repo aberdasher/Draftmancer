@@ -4,8 +4,9 @@ import { Session, Sessions } from "../Session.js";
 import { Connection, Connections } from "../Connection.js";
 import type { UserID } from "../IDTypes.js";
 import { convertCubeCobraList } from "../cubeCobraIntegration.js";
-import { isSocketError, Message, ToastMessage } from "../Message.js";
+import { isSocketError, Message, MessageError, ToastMessage } from "../Message.js";
 import { isRecord, isString, isUnknown } from "../TypeChecks.js";
+import { ReadyState } from "../Session/SessionTypes.js";
 import type { HostedSeat, HostedSessionSpec, HostedStatus } from "./types.js";
 
 export type CubeFetcher = (cubeID: string) => Promise<Record<string, unknown>>;
@@ -77,6 +78,7 @@ export async function createHostedSession(
 		userID: seatUserID(spec.sessionID, i),
 		connected: false,
 		disconnectedSince: null,
+		ready: "unknown",
 	}));
 
 	Sessions[spec.sessionID] = session;
@@ -178,6 +180,113 @@ export function setSeatConnected(session: Session, userID: UserID, connected: bo
 	if (!seat) return;
 	seat.connected = connected;
 	seat.disconnectedSince = connected ? null : Date.now();
+	// A leave invalidates the ready check, as it does in Draftmancer's own UI.
+	if (!connected) clearReadyCheck(session);
+}
+
+/** Names of the seats whose player is not connected, in seat order. */
+export function missingSeats(session: Session): string[] {
+	return session.seats.filter((seat) => !seat.connected).map((seat) => seat.name);
+}
+
+export type HostedRefusal = { status: 400 | 409 | 500; body: Record<string, unknown> };
+
+const notGathering = (session: Session): HostedRefusal | null =>
+	session.drafting || session.draftLog ? { status: 409, body: { error: "The draft has already started." } } : null;
+
+const seatsMissing = (session: Session): HostedRefusal | null => {
+	const missing = missingSeats(session);
+	return missing.length > 0 ? { status: 409, body: { missing } } : null;
+};
+
+// Sessions with a ready check whose answers still count.
+const pendingReadyChecks = new WeakSet<Session>();
+
+function clearReadyCheck(session: Session) {
+	pendingReadyChecks.delete(session);
+	for (const seat of session.seats) seat.ready = "unknown";
+}
+
+/** Runs Draftmancer's in-app ready check for every seat; players answer with the usual `setReady`. */
+export function startHostedReadyCheck(session: Session): HostedRefusal | null {
+	const refusal = notGathering(session) ?? seatsMissing(session);
+	if (refusal) return refusal;
+	clearReadyCheck(session);
+	pendingReadyChecks.add(session);
+	for (const seat of session.seats) Connections[seat.userID]?.socket.emit("readyCheck");
+	return null;
+}
+
+/** Records a seat's answer to the pending ready check; answers outside a check are ignored. */
+export function recordSeatReady(session: Session, userID: UserID, readyState: ReadyState) {
+	if (!pendingReadyChecks.has(session)) return;
+	const seat = session.seats.find((s) => s.userID === userID);
+	if (!seat) return;
+	if (readyState === ReadyState.Ready) seat.ready = "ready";
+	else if (readyState === ReadyState.NotReady) seat.ready = "not-ready";
+}
+
+const isPermutationOf = (names: string[], of: string[]) =>
+	names.length === of.length && new Set(names).size === names.length && names.every((n) => of.includes(n));
+
+/** Orders the seats as `order`, a permutation of the seat names; the draft seats players in this order. */
+export function setHostedSeating(session: Session, order: string[]): HostedRefusal | null {
+	const refusal = notGathering(session);
+	if (refusal) return refusal;
+	const names = session.seats.map((seat) => seat.name);
+	if (!isPermutationOf(order, names))
+		return { status: 400, body: { error: "The order must name every seat exactly once." } };
+	session.seats = order.map((name) => session.seats.find((seat) => seat.name === name)!);
+	return null;
+}
+
+function nextSeatIndex(session: Session): number {
+	const prefix = seatUserID(session.id, 0).slice(0, -1);
+	const used = session.seats.map((seat) => Number(seat.userID.slice(prefix.length)));
+	return used.length === 0 ? 0 : Math.max(...used) + 1;
+}
+
+/**
+ * Replaces the expected players while the session gathers. Seats whose names remain keep their seat ID and
+ * connection; new names get empty seats; a player whose name is gone loses the seat and is sent away.
+ */
+export function setHostedPlayers(session: Session, players: string[]): HostedRefusal | null {
+	const refusal = notGathering(session);
+	if (refusal) return refusal;
+	const kept = new Map(session.seats.filter((seat) => players.includes(seat.name)).map((seat) => [seat.name, seat]));
+	const removed = session.seats.filter((seat) => !players.includes(seat.name));
+	let index = nextSeatIndex(session);
+	session.seats = players.map(
+		(name) =>
+			kept.get(name) ?? {
+				name,
+				userID: seatUserID(session.id, index++),
+				connected: false,
+				disconnectedSince: null,
+				ready: "unknown",
+			}
+	);
+	if (session.hostedSpec) session.hostedSpec.players = [...players];
+	clearReadyCheck(session);
+	for (const seat of removed) {
+		const connection = Connections[seat.userID];
+		if (!connection) continue;
+		connection.socket.emit("message", new MessageError("Seat removed", "You are no longer listed for this draft."));
+		connection.socket.disconnect(true);
+	}
+	return null;
+}
+
+/** Starts the draft with every seat connected, seating players in seat order (never randomised). */
+export function startHostedDraft(session: Session): HostedRefusal | null {
+	const refusal = notGathering(session) ?? seatsMissing(session);
+	if (refusal) return refusal;
+	session.setRandomizeSeatingOrder(false);
+	if (!session.setSeating(session.seats.map((seat) => seat.userID)))
+		return { status: 500, body: { error: "The session holds players without a seat." } };
+	const result = session.startDraft();
+	if (isSocketError(result)) return { status: 500, body: { error: result.error?.title ?? "Could not start." } };
+	return null;
 }
 
 export const SeatRefusals: Record<"seat-in-use" | "no-such-seat", [title: string, text: string]> = {

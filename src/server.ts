@@ -77,7 +77,14 @@ import { convertCubeCobraList, DraftFormat, importFormat as convertDraftFormat }
 import { setBatchWindow } from "./bots/CubeCobraBots.js";
 import { MinesweeperDraftState } from "./MinesweeperDraft.js";
 import { registerHostedRoutes } from "./hosted/HostedAPI.js";
-import { bindHostedSeat, holdsSeat, isSeatUserID, SeatRefusals, setSeatConnected } from "./hosted/HostedSessions.js";
+import {
+	bindHostedSeat,
+	holdsSeat,
+	isSeatUserID,
+	recordSeatReady,
+	SeatRefusals,
+	setSeatConnected,
+} from "./hosted/HostedSessions.js";
 
 if (process.env.NODE_ENV === "production") MTGOAPIInit();
 
@@ -342,6 +349,7 @@ function chatMessage(
 
 function setReady(userID: UserID, sessionID: SessionID, readyState: ReadyState) {
 	if (!isString(readyState)) return;
+	if (Sessions[sessionID].hosted) recordSeatReady(Sessions[sessionID], userID, readyState);
 	Sessions[sessionID].forUsers((user) => Connections[user]?.socket.emit("setReady", userID, readyState));
 }
 

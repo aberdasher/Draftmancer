@@ -1,6 +1,15 @@
 import express from "express";
 import { timingSafeEqual } from "node:crypto";
-import { createHostedSession, hostedStatus } from "./HostedSessions.js";
+import { Session, Sessions } from "../Session.js";
+import {
+	createHostedSession,
+	HostedRefusal,
+	hostedStatus,
+	setHostedPlayers,
+	setHostedSeating,
+	startHostedDraft,
+	startHostedReadyCheck,
+} from "./HostedSessions.js";
 import type { HostedSessionSpec } from "./types.js";
 
 /** Bearer-token guard; the token is read from the environment on every request. */
@@ -29,6 +38,25 @@ function parseSpec(id: string, body: unknown): HostedSessionSpec | null {
 	return body as HostedSessionSpec;
 }
 
+const isNameList = (v: unknown): v is string[] =>
+	Array.isArray(v) &&
+	v.length > 0 &&
+	v.every((p) => typeof p === "string" && p !== "") &&
+	new Set(v).size === v.length;
+
+/** Runs `action` on the hosted session named by the route: 404 when there is none, 200 unless it refuses. */
+function onSession(action: (session: Session, req: express.Request) => HostedRefusal | null) {
+	return (req: express.Request, res: express.Response) => {
+		const session = Sessions[String(req.params.id)];
+		if (!session?.hosted) return void res.sendStatus(404);
+		const refusal = action(session, req);
+		if (refusal) return void res.status(refusal.status).json(refusal.body);
+		res.status(200).json({ result: "ok" });
+	};
+}
+
+const invalid = (error: string): HostedRefusal => ({ status: 400, body: { error } });
+
 export function registerHostedRoutes(app: express.Express): void {
 	app.put("/api/hosted/sessions/:id", requireBearer, async (req, res) => {
 		const spec = parseSpec(String(req.params.id), req.body);
@@ -48,4 +76,28 @@ export function registerHostedRoutes(app: express.Express): void {
 		if (!status) return void res.sendStatus(404);
 		res.json(status);
 	});
+
+	app.put(
+		"/api/hosted/sessions/:id/players",
+		requireBearer,
+		onSession((session, req) =>
+			isNameList(req.body?.players)
+				? setHostedPlayers(session, req.body.players)
+				: invalid("players must be a list of distinct, non-empty names.")
+		)
+	);
+
+	app.put(
+		"/api/hosted/sessions/:id/seating",
+		requireBearer,
+		onSession((session, req) =>
+			isNameList(req.body?.order)
+				? setHostedSeating(session, req.body.order)
+				: invalid("order must be a list of distinct, non-empty names.")
+		)
+	);
+
+	app.post("/api/hosted/sessions/:id/ready-check", requireBearer, onSession(startHostedReadyCheck));
+
+	app.post("/api/hosted/sessions/:id/start", requireBearer, onSession(startHostedDraft));
 }

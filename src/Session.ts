@@ -388,10 +388,12 @@ export class Session implements IIndexable {
 		this.users.delete(userID);
 
 		// User was the owner of the session, transfer ownership to the first available users.
-		if (this.owner === userID) this.owner = this.users.values().next().value;
+		// Hosted sessions never have an owner: the hosted API controls them.
+		if (this.owner === userID && !this.hosted) this.owner = this.users.values().next().value;
 
 		if (this.drafting) {
-			if (this.managed) {
+			// Hosted sessions wait for disconnected players instead of replacing them by a bot.
+			if (this.managed && !this.hosted) {
 				// If user is still disconnected after a timeout, replace them by a bot.
 				const timeoutSeconds = 30;
 				setTimeout(() => {
