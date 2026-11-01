@@ -76,6 +76,7 @@ import { CardPool } from "./CardPool.js";
 import { convertCubeCobraList, DraftFormat, importFormat as convertDraftFormat } from "./cubeCobraIntegration.js";
 import { setBatchWindow } from "./bots/CubeCobraBots.js";
 import { MinesweeperDraftState } from "./MinesweeperDraft.js";
+import { registerHostedRoutes } from "./hosted/HostedAPI.js";
 
 if (process.env.NODE_ENV === "production") MTGOAPIInit();
 
@@ -2360,6 +2361,8 @@ app.post("/setBotBatchWindow", requirePOSTAPIKey, (req, res) => {
 		res.sendStatus(500);
 	}
 });
+
+registerHostedRoutes(app);
 
 Promise.all([InactiveConnections, InactiveSessions]).then(() => {
 	httpServer.listen(DraftmancerPort, () => {

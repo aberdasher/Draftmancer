@@ -1,5 +1,6 @@
 import { assert } from "console";
 import { UserID, SessionID } from "./IDTypes.js";
+import type { HostedSeat } from "./hosted/types.js";
 import {
 	shuffleArray,
 	getRandom,
@@ -140,6 +141,8 @@ export class Session implements IIndexable {
 	id: SessionID;
 	owner?: UserID;
 	readonly managed: boolean = false;
+	readonly hosted: boolean = false; // Owner-less session controlled through the hosted API (src/hosted).
+	seats: HostedSeat[] = [];
 	userOrder: Array<string> = [];
 	users: Set<UserID> = new Set();
 	spectators: Set<UserID> = new Set();
@@ -208,11 +211,12 @@ export class Session implements IIndexable {
 	constructor(
 		id: SessionID,
 		owner: UserID | undefined,
-		options: { managed?: boolean } & Record<keyof typeof SessionsSettingsProps, unknown> = {}
+		options: { managed?: boolean; hosted?: boolean } & Record<keyof typeof SessionsSettingsProps, unknown> = {}
 	) {
 		this.id = id;
 		this.owner = owner;
 		if (options.managed) this.managed = options.managed;
+		if (options.hosted) this.hosted = options.hosted;
 
 		// Validate and set session settings
 		for (const p in options)
