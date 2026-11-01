@@ -4,7 +4,14 @@ import { Session, Sessions } from "../Session.js";
 import {
 	createHostedSession,
 	HostedRefusal,
+	hostedLog,
 	hostedStatus,
+	pauseHostedDraft,
+	releaseHostedLog,
+	removeHostedUser,
+	replaceSeatWithBot,
+	resumeHostedDraft,
+	stopHostedSession,
 	setHostedPlayers,
 	setHostedSeating,
 	startHostedDraft,
@@ -100,4 +107,32 @@ export function registerHostedRoutes(app: express.Express): void {
 	app.post("/api/hosted/sessions/:id/ready-check", requireBearer, onSession(startHostedReadyCheck));
 
 	app.post("/api/hosted/sessions/:id/start", requireBearer, onSession(startHostedDraft));
+
+	app.post("/api/hosted/sessions/:id/pause", requireBearer, onSession(pauseHostedDraft));
+
+	app.post("/api/hosted/sessions/:id/resume", requireBearer, onSession(resumeHostedDraft));
+
+	app.post("/api/hosted/sessions/:id/stop", requireBearer, onSession(stopHostedSession));
+
+	app.post("/api/hosted/sessions/:id/release-log", requireBearer, onSession(releaseHostedLog));
+
+	app.post(
+		"/api/hosted/sessions/:id/seats/:name/replace-with-bot",
+		requireBearer,
+		onSession((session, req) => replaceSeatWithBot(session, String(req.params.name)))
+	);
+
+	app.delete(
+		"/api/hosted/sessions/:id/users/:userID",
+		requireBearer,
+		onSession((session, req) => removeHostedUser(session, String(req.params.userID)))
+	);
+
+	// The full log, even while it is locked for the players; 404 until the draft ends.
+	app.get("/api/hosted/sessions/:id/log", requireBearer, (req, res) => {
+		const session = Sessions[String(req.params.id)];
+		const log = session?.hosted ? hostedLog(session) : undefined;
+		if (!log) return void res.sendStatus(404);
+		res.json(log);
+	});
 }

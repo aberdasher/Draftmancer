@@ -40,6 +40,7 @@ import { sendLog } from "./BotTrainingAPI.js";
 import { deserializeBracket } from "./BracketSerialization.js";
 import { hasProperty, isString } from "./TypeChecks.js";
 import { DefaultTiebreakers } from "./SilentAuctionDraftTiebreakers.js";
+import { onHostedSessionRestored, setDeletionPersister } from "./hosted/HostedSessions.js";
 
 const PersistenceLocalPath = process.env.PERSISTENCE_LOCAL_PATH ?? ".";
 const LocalPersitenceDirectory = "tmp";
@@ -435,6 +436,7 @@ function restoreHostedSessions() {
 		// Players join again as they reconnect; only a drafting session keeps its seating.
 		if (!session.drafting) session.userOrder = [];
 		Sessions[sessionID] = session;
+		onHostedSessionRestored(session);
 	}
 }
 
@@ -524,4 +526,6 @@ if (!DisablePersistence) {
 	}
 
 	startPeriodicDump(dumpIntervalMs());
+	// A deleted hosted session must not come back if the server crashes before the next periodic dump.
+	setDeletionPersister(() => dumpToDisk());
 }

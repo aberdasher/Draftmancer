@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from "node:util";
 import { Session, Sessions } from "../Session.js";
 import { Connection, Connections } from "../Connection.js";
 import type { UserID } from "../IDTypes.js";
+import type { DraftLog } from "../DraftLog.js";
 import { convertCubeCobraList } from "../cubeCobraIntegration.js";
 import { isSocketError, Message, MessageError, ToastMessage } from "../Message.js";
 import { isRecord, isString, isUnknown } from "../TypeChecks.js";
@@ -196,7 +197,7 @@ export function missingSeats(session: Session): string[] {
 	return session.seats.filter((seat) => !seat.connected).map((seat) => seat.name);
 }
 
-export type HostedRefusal = { status: 400 | 409 | 500; body: Record<string, unknown> };
+export type HostedRefusal = { status: 400 | 404 | 409 | 500; body: Record<string, unknown> };
 
 const notGathering = (session: Session): HostedRefusal | null =>
 	session.drafting || session.draftLog ? { status: 409, body: { error: "The draft has already started." } } : null;
@@ -294,6 +295,190 @@ export function startHostedDraft(session: Session): HostedRefusal | null {
 	const result = session.startDraft();
 	if (isSocketError(result)) return { status: 500, body: { error: result.error?.title ?? "Could not start." } };
 	return null;
+}
+
+const notDrafting = (session: Session): HostedRefusal | null =>
+	session.drafting ? null : { status: 409, body: { error: "No draft is running." } };
+
+const conflict = (error: string): HostedRefusal => ({ status: 409, body: { error } });
+
+export function pauseHostedDraft(session: Session): HostedRefusal | null {
+	const refusal = notDrafting(session);
+	if (refusal) return refusal;
+	if (!session.draftPaused) session.pauseDraft();
+	return null;
+}
+
+export function resumeHostedDraft(session: Session): HostedRefusal | null {
+	const refusal = notDrafting(session);
+	if (refusal) return refusal;
+	session.resumeDraft();
+	return null;
+}
+
+// Drafts ended by `stop` rather than played out: their log is not pushed.
+const stoppedDrafts = new WeakSet<Session>();
+
+/**
+ * Stops the session: a running draft ends at once (its log is kept but not pushed, as the draft did not finish);
+ * a session whose draft never started is deleted, and anyone waiting in it is sent away.
+ */
+export function stopHostedSession(session: Session): HostedRefusal | null {
+	if (session.drafting) {
+		stoppedDrafts.add(session);
+		session.stopDraft();
+		return null;
+	}
+	if (session.draftLog) return conflict("The draft has already ended.");
+	deleteHostedSession(session);
+	for (const seat of session.seats) {
+		const connection = Connections[seat.userID];
+		if (connection?.sessionID !== session.id) continue;
+		connection.socket.emit("message", new MessageError("Draft cancelled", "This draft was cancelled."));
+		connection.socket.disconnect(true);
+	}
+	return null;
+}
+
+const draftEnded = (session: Session) => !session.drafting && session.draftLog !== undefined;
+
+/** Unlocks the delayed log for the players, as the owner's `shareDraftLog` does. */
+export function releaseHostedLog(session: Session): HostedRefusal | null {
+	if (!draftEnded(session)) return conflict("The draft has not ended.");
+	session.unlockLogs(session.draftLog!.time);
+	return null;
+}
+
+/** Hands a seat whose player left mid-draft to a bot (an admin decision; never automatic). */
+export function replaceSeatWithBot(session: Session, name: string): HostedRefusal | null {
+	const seat = session.seats.find((s) => s.name === name);
+	if (!seat) return { status: 404, body: { error: "No such seat." } };
+	const left = session.disconnectedUsers[seat.userID];
+	if (!session.drafting || !left || left.replaced)
+		return conflict("Only a seat whose player left the running draft can be given to a bot.");
+	session.replaceDisconnectedPlayer(seat.userID);
+	return null;
+}
+
+/** Sends away a user connected to this session; a seat holder's seat is freed for its rightful player. */
+export function removeHostedUser(session: Session, userID: UserID): HostedRefusal | null {
+	const connection = Connections[userID];
+	if (connection?.sessionID !== session.id) return { status: 404, body: { error: "No such user." } };
+	if (session.spectators.has(userID)) session.removeSpectator(userID);
+	connection.socket.emit("message", new MessageError("Removed from the draft", "The organizer removed you."));
+	connection.socket.disconnect(true);
+	return null;
+}
+
+/** The full log, even while it is locked for the players, with each user's seat; undefined until the draft ends. */
+export function hostedLog(session: Session): DraftLog | undefined {
+	if (!draftEnded(session)) return undefined;
+	const log = session.draftLog!;
+	// Users are recorded in seating order; DraftBot matches them to its sign-ups by seatNum.
+	const users = Object.fromEntries(
+		Object.entries(log.users).map(([id, user], seatNum) => [id, { ...user, seatNum }])
+	);
+	return { ...log, users };
+}
+
+/** HOSTED_ENDED_LIFETIME_MS when it is a positive number of milliseconds, 24 hours otherwise. */
+export function endedSessionLifetimeMs(env: NodeJS.ProcessEnv = process.env): number {
+	const ms = Number(env.HOSTED_ENDED_LIFETIME_MS);
+	return env.HOSTED_ENDED_LIFETIME_MS && Number.isFinite(ms) && ms > 0 ? ms : 24 * 60 * 60 * 1000;
+}
+
+let persistDeletion: () => void = () => {};
+
+/** Makes deletions durable at once (persistence installs a dump), so a crash cannot bring a deleted session back. */
+export function setDeletionPersister(persist?: () => void) {
+	persistDeletion = persist ?? (() => {});
+}
+
+const endOfLifeTimers = new WeakMap<Session, NodeJS.Timeout>();
+
+export function deleteHostedSession(session: Session) {
+	clearTimeout(endOfLifeTimers.get(session));
+	endOfLifeTimers.delete(session);
+	if (Sessions[session.id] !== session) return;
+	session.beforeDelete();
+	delete Sessions[session.id];
+	try {
+		persistDeletion();
+	} catch (e) {
+		console.error(`Error persisting the deletion of hosted session ${session.id}:`, e);
+	}
+}
+
+/** Deletes an ended session once its lifetime, counted from the end of the draft, is over. */
+function scheduleEndOfLife(session: Session) {
+	clearTimeout(endOfLifeTimers.get(session));
+	const remaining = (session.hostedEndedAt ?? Date.now()) + endedSessionLifetimeMs() - Date.now();
+	const timer = setTimeout(() => deleteHostedSession(session), Math.max(0, remaining));
+	timer.unref();
+	endOfLifeTimers.set(session, timer);
+}
+
+/** A restored session whose draft had ended keeps the lifetime it had; the reconciler can still pull its log. */
+export function onHostedSessionRestored(session: Session) {
+	if (!draftEnded(session)) return;
+	session.hostedEndedAt ??= Date.now();
+	scheduleEndOfLife(session);
+}
+
+export type Wait = (ms: number) => Promise<void>;
+const realWait: Wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let wait: Wait = realWait;
+
+/** Replaces the wait between push attempts (tests); call with no argument to restore the default. */
+export function setLogPushWait(w?: Wait) {
+	wait = w ?? realWait;
+}
+
+export const LogPushBackoffMs = [2000, 4000, 8000, 16000];
+
+/** POSTs `{sessionID, log}` to `url`, retrying with back-off; resolves to whether it was delivered, never rejects. */
+export async function pushHostedLog(url: string, sessionID: string, log: DraftLog): Promise<boolean> {
+	const attempts = LogPushBackoffMs.length + 1;
+	for (let attempt = 1; attempt <= attempts; ++attempt) {
+		if (attempt > 1) await wait(LogPushBackoffMs[attempt - 2]);
+		try {
+			const token = process.env.DRAFTBOT_API_TOKEN;
+			if (!token) console.error(`Pushing the log of hosted session ${sessionID} without DRAFTBOT_API_TOKEN.`);
+			await axios.post(
+				url,
+				{ sessionID, log },
+				{
+					headers: token ? { Authorization: `Bearer ${token}` } : {},
+					timeout: 30000,
+					maxBodyLength: Infinity,
+					maxContentLength: Infinity,
+				}
+			);
+			return true;
+		} catch (e) {
+			const reason = axios.isAxiosError(e) ? (e.response?.status ?? e.code ?? e.message) : e;
+			console.error(
+				`Pushing the log of hosted session ${sessionID} failed (attempt ${attempt}/${attempts}):`,
+				reason
+			);
+		}
+	}
+	return false;
+}
+
+/**
+ * Called by Session.endDraft once the draft has ended: starts the session's lifetime and pushes the full log to the
+ * session's webhook; a delivered log ends the session at once.
+ */
+export function onHostedDraftEnded(session: Session): void {
+	session.hostedEndedAt = Date.now();
+	scheduleEndOfLife(session);
+	const url = session.hostedSpec?.logWebhook;
+	const log = hostedLog(session);
+	if (!url || !log || stoppedDrafts.has(session)) return;
+	void pushHostedLog(url, session.id, log).then((delivered) => {
+		if (delivered) deleteHostedSession(session);
+	});
 }
 
 export const SeatRefusals: Record<"seat-in-use" | "no-such-seat", [title: string, text: string]> = {

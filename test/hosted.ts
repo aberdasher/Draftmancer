@@ -4,13 +4,22 @@ import { expect } from "chai";
 import { Cards } from "../src/Cards.js";
 import { Sessions } from "../src/Session.js";
 import { DraftmancerPort } from "../src/server.js";
-import { setCubeFetcher } from "../src/hosted/HostedSessions.js";
+import {
+	endedSessionLifetimeMs,
+	setCubeFetcher,
+	setDeletionPersister,
+	setLogPushWait,
+} from "../src/hosted/HostedSessions.js";
 import type { HostedSessionSpec } from "../src/hosted/types.js";
 import { Connections } from "../src/Connection.js";
 import { ReadyState } from "../src/Session/SessionTypes.js";
 import { isDraftState } from "../src/DraftState.js";
 import { connectClient, disableLogs, enableLogs, getUID } from "./src/common.js";
 import { dumpIntervalMs, dumpToDisk, loadFromDisk, startPeriodicDump } from "../src/Persistence.js";
+import type { DraftLog } from "../src/DraftLog.js";
+import express from "express";
+import type { AddressInfo } from "net";
+import type { Server } from "http";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -130,8 +139,8 @@ describe("Hosted sessions", function () {
 	describe("Seats", function () {
 		const clients: ReturnType<typeof connectClient>[] = [];
 
-		async function hostedSession(sessionID: string, players: string[]) {
-			const spec = { ...makeSpec(sessionID), players };
+		async function hostedSession(sessionID: string, players: string[], overrides: Partial<HostedSessionSpec> = {}) {
+			const spec = { ...makeSpec(sessionID), players, ...overrides };
 			expect((await axios.put(`${base}/${sessionID}`, spec, auth)).status).to.equal(200);
 			return Sessions[sessionID];
 		}
@@ -312,8 +321,12 @@ describe("Hosted sessions", function () {
 				return Object.fromEntries(joined.map((j) => [j.name, j]));
 			}
 
-			async function startedSession(sessionID: string, players: string[]) {
-				const session = await hostedSession(sessionID, players);
+			async function startedSession(
+				sessionID: string,
+				players: string[],
+				overrides: Partial<HostedSessionSpec> = {}
+			) {
+				const session = await hostedSession(sessionID, players, overrides);
 				const clients = await seatEveryone(session);
 				expect((await api("post", `${sessionID}/start`)).status).to.equal(200);
 				await until(() => session.drafting, "the draft to start");
@@ -619,11 +632,298 @@ describe("Hosted sessions", function () {
 					expect(saved.find((s) => s.id === session.id)?.seats).to.deep.equal(session.seats);
 				});
 
+				it("an ended session restored after a crash is still deleted after its lifetime", async function () {
+					const { session } = await startedSession("hosted-restart-ended", ["Alice", "Bob"]);
+					session.endDraft();
+					await until(() => !session.drafting, "the draft to end");
+					const endedAt = session.hostedEndedAt;
+					expect(endedAt).to.be.a("number");
+
+					await crashAndRestart(session.id);
+					const restored = Sessions[session.id];
+					expect(restored).to.exist.and.not.equal(session);
+					expect(restored.hostedEndedAt).to.equal(endedAt);
+					expect((await axios.get(`${base}/${session.id}/log`, auth)).status).to.equal(200);
+
+					// The lifetime counts from the end of the draft, not from the restart.
+					process.env.HOSTED_ENDED_LIFETIME_MS = String(Date.now() - endedAt! + 300);
+					try {
+						await crashAndRestart(session.id);
+						await until(() => !(session.id in Sessions), "the restored session to be deleted");
+					} finally {
+						delete process.env.HOSTED_ENDED_LIFETIME_MS;
+					}
+				});
+
+				it("a deleted session does not come back on restart", async function () {
+					const session = await hostedSession("hosted-restart-deleted", ["Alice", "Bob"]);
+					dumpToDisk({ dir });
+					setDeletionPersister(() => dumpToDisk({ dir }));
+					try {
+						expect((await api("post", `${session.id}/stop`)).status).to.equal(200);
+					} finally {
+						setDeletionPersister();
+					}
+					await loadFromDisk(dir);
+					expect(session.id in Sessions).to.be.false;
+				});
+
 				it("the dump interval comes from HOSTED_DUMP_INTERVAL_MS, 30 s by default", function () {
 					expect(dumpIntervalMs({})).to.equal(30000);
 					expect(dumpIntervalMs({ HOSTED_DUMP_INTERVAL_MS: "5000" })).to.equal(5000);
 					for (const bad of ["", "0", "-1", "soon"])
 						expect(dumpIntervalMs({ HOSTED_DUMP_INTERVAL_MS: bad })).to.equal(30000);
+				});
+			});
+
+			describe("Draft controls and the finished log", function () {
+				type Push = { authorization: string | undefined; body: { sessionID: string; log: DraftLog } };
+				const pushes: Push[] = [];
+				const waits: number[] = [];
+				let failuresLeft = 0;
+				let hook: Server;
+				let hookURL: string;
+
+				before(async function () {
+					const app = express();
+					app.use(express.json({ limit: "100mb" }));
+					app.post("/draft-log", (req, res) => {
+						pushes.push({ authorization: req.headers.authorization, body: req.body });
+						if (failuresLeft > 0) {
+							--failuresLeft;
+							return void res.sendStatus(500);
+						}
+						res.sendStatus(200);
+					});
+					await new Promise<void>((resolve) => (hook = app.listen(0, "127.0.0.1", () => resolve())));
+					hookURL = `http://127.0.0.1:${(hook.address() as AddressInfo).port}/draft-log`;
+					setLogPushWait(async (ms) => void waits.push(ms));
+				});
+				after(function () {
+					hook.close();
+					setLogPushWait();
+				});
+				beforeEach(function () {
+					pushes.length = 0;
+					waits.length = 0;
+					failuresLeft = 0;
+				});
+				afterEach(function () {
+					delete process.env.HOSTED_ENDED_LIFETIME_MS;
+				});
+
+				const getLog = (sessionID: string) => axios.get(`${base}/${sessionID}/log`, auth);
+				const settle = () => new Promise((r) => setTimeout(r, 100));
+				// Tests unlock delayed logs after 1 ms; without a timer the log stays locked until released.
+				const keepLogLocked = (session: (typeof Sessions)[string]) => (session.draftLogUnlockTimer = 0);
+
+				it("the finished log is pushed to the webhook", async function () {
+					const { session } = await startedSession("hosted-push", ["Alice", "Bob", "Carol"], {
+						logWebhook: hookURL,
+					});
+					const seatIDs = session.seats.map((s) => s.userID);
+					keepLogLocked(session);
+					session.endDraft();
+					await until(() => pushes.length > 0, "the push");
+					await settle();
+
+					expect(pushes).to.have.length(1);
+					const [{ authorization, body }] = pushes;
+					expect(authorization).to.equal("Bearer test-hosted-token");
+					expect(body.sessionID).to.equal(session.id);
+					expect(body.log.sessionID).to.equal(session.id);
+					expect(body.log.time).to.be.a("number");
+					expect(body.log.delayed).to.be.true; // Still locked for the players, yet sent in full.
+					expect(Object.keys(body.log.users)).to.deep.equal(seatIDs);
+					expect(seatIDs.map((id) => (body.log.users[id] as { seatNum?: number }).seatNum)).to.deep.equal([
+						0, 1, 2,
+					]);
+					for (const id of seatIDs) expect(body.log.users[id].picks).to.be.an("array");
+					expect(body.log.boosters.length).to.be.above(0);
+					expect(waits).to.deep.equal([]);
+
+					// Delivered: the session has done its job and goes away.
+					await until(() => !(session.id in Sessions), "the session to be deleted");
+					expect((await getLog(session.id)).status).to.equal(404);
+				});
+
+				it("the push retries when the webhook fails", async function () {
+					failuresLeft = 2;
+					const { session } = await startedSession("hosted-push-retry", ["Alice", "Bob"], {
+						logWebhook: hookURL,
+					});
+					session.endDraft();
+					await until(() => pushes.length === 3, "three attempts");
+					await settle();
+					expect(pushes).to.have.length(3);
+					expect(waits).to.deep.equal([2000, 4000]);
+					expect(new Set(pushes.map((p) => JSON.stringify(p.body))).size).to.equal(1);
+					await until(() => !(session.id in Sessions), "the session to be deleted");
+				});
+
+				it("the push gives up after five attempts and keeps the log fetchable", async function () {
+					failuresLeft = 100;
+					const { session } = await startedSession("hosted-push-gives-up", ["Alice", "Bob"], {
+						logWebhook: hookURL,
+					});
+					session.endDraft();
+					await until(() => pushes.length === 5, "five attempts");
+					await settle();
+					expect(pushes).to.have.length(5);
+					expect(waits).to.deep.equal([2000, 4000, 8000, 16000]);
+					expect(Sessions[session.id]).to.equal(session);
+					expect((await getLog(session.id)).status).to.equal(200);
+				});
+
+				it("GET log returns the full log while it is delayed for the public", async function () {
+					const session = await hostedSession("hosted-get-log", ["Alice", "Bob"]);
+					const { Alice } = await seatEveryone(session);
+					let picked = false;
+					Alice.c.on("draftState", (state) => {
+						if (picked || !state.booster?.length) return;
+						picked = true;
+						Alice.c.emit("pickCard", { pickedCards: [0], burnedCards: [] }, () => {});
+					});
+					expect((await getLog(session.id)).status).to.equal(404);
+					expect((await api("post", `${session.id}/start`)).status).to.equal(200);
+					const alice = session.seats[0].userID;
+					await until(() => (session.draftLog?.users[alice]?.picks.length ?? 0) === 1, "Alice's pick");
+					expect((await getLog(session.id)).status).to.equal(404); // Not until the draft ends.
+
+					keepLogLocked(session);
+					session.endDraft();
+					await until(() => !session.drafting, "the draft to end");
+					expect(session.draftLog!.delayed).to.be.true;
+					const r = await getLog(session.id);
+					expect(r.status).to.equal(200);
+					const log = r.data as DraftLog;
+					expect(log.delayed).to.be.true;
+					expect(log.users[alice].picks).to.have.length(1);
+					expect(log.boosters).to.deep.equal(session.draftLog!.boosters);
+					expect(Object.keys(log.carddata)).to.have.length(Object.keys(session.draftLog!.carddata).length);
+					// What players see is stripped of everyone else's picks.
+					expect(session.getStrippedLog(session.seats[1].userID)!.users[alice].picks).to.deep.equal([]);
+
+					expect((await axios.get(`${base}/does-not-exist/log`, auth)).status).to.equal(404);
+					expect(
+						(await axios.get(`${base}/${session.id}/log`, { validateStatus: () => true })).status
+					).to.equal(401);
+				});
+
+				it("release-log unlocks the log for everyone", async function () {
+					const { session } = await startedSession("hosted-release", ["Alice", "Bob"]);
+					expect((await api("post", `${session.id}/release-log`)).status).to.equal(409);
+					keepLogLocked(session);
+					session.endDraft();
+					await until(() => !session.drafting, "the draft to end");
+					expect(session.draftLog!.delayed).to.be.true;
+					expect((await api("post", `${session.id}/release-log`)).status).to.equal(200);
+					expect(session.draftLog!.delayed).to.be.false;
+					expect((await api("post", `${session.id}/release-log`)).status).to.equal(200);
+				});
+
+				it("replace-with-bot puts a bot in that seat only", async function () {
+					const gathering = await hostedSession("hosted-bot-gathering", ["Alice", "Bob"]);
+					expect((await api("post", `${gathering.id}/seats/Bob/replace-with-bot`)).status).to.equal(409);
+
+					const players = ["Alice", "Bob Smith", "Carol"];
+					const { session, clients } = await startedSession("hosted-bot", players);
+					const [alice, bob, carol] = session.seats.map((s) => s.userID);
+					const replace = (name: string) =>
+						api("post", `${session.id}/seats/${encodeURIComponent(name)}/replace-with-bot`);
+
+					expect((await replace("Bob Smith")).status).to.equal(409); // Still connected.
+					expect((await replace("Mallory")).status).to.equal(404);
+					clients["Bob Smith"].c.disconnect();
+					await until(() => bob in session.disconnectedUsers, "Bob to be marked disconnected");
+
+					expect((await replace("Alice")).status).to.equal(409);
+					expect((await replace("Bob Smith")).status).to.equal(200);
+					await until(() => session.draftLog!.users[bob].picks.length > 0, "the bot to pick for Bob");
+					await settle();
+					expect(session.disconnectedUsers[bob].replaced).to.be.true;
+					for (const other of [alice, carol]) {
+						expect(other in session.disconnectedUsers).to.be.false;
+						expect(session.draftLog!.users[other].picks).to.deep.equal([]);
+					}
+					expect((await replace("Bob Smith")).status).to.equal(409); // Already a bot.
+				});
+
+				it("pause and resume stop and restart the pick timer", async function () {
+					const gathering = await hostedSession("hosted-pause-gathering", ["Alice"]);
+					expect((await api("post", `${gathering.id}/pause`)).status).to.equal(409);
+					expect((await api("post", `${gathering.id}/resume`)).status).to.equal(409);
+
+					const { session } = await startedSession("hosted-pause", ["Alice", "Bob"]);
+					const draft = session.draftState;
+					if (!isDraftState(draft)) throw new Error("Expected a draft");
+					const timers = () => Object.values(draft.players).map((p) => p.countdownInterval);
+					expect(timers().every((t) => t !== null)).to.be.true;
+
+					expect((await api("post", `${session.id}/pause`)).status).to.equal(200);
+					expect(session.draftPaused).to.be.true;
+					expect(timers().every((t) => t === null)).to.be.true;
+
+					expect((await api("post", `${session.id}/resume`)).status).to.equal(200);
+					expect(session.draftPaused).to.be.false;
+					expect(timers().every((t) => t !== null)).to.be.true;
+				});
+
+				it("stop ends the draft", async function () {
+					const { session } = await startedSession("hosted-stop", ["Alice", "Bob"], {
+						logWebhook: hookURL,
+					});
+					expect((await api("post", `${session.id}/stop`)).status).to.equal(200);
+					await until(() => !session.drafting, "the draft to stop");
+					await settle();
+					const status = await axios.get(`${base}/${session.id}`, auth);
+					expect(status.data.stage).to.equal("ended");
+					expect((await getLog(session.id)).status).to.equal(200);
+					// A stopped draft is not a finished one: DraftBot is not sent its log.
+					expect(pushes).to.deep.equal([]);
+					expect((await api("post", `${session.id}/stop`)).status).to.equal(409);
+				});
+
+				it("stop before the draft starts deletes the session", async function () {
+					const session = await hostedSession("hosted-stop-gathering", ["Alice", "Bob"]);
+					const { Alice } = await seatEveryone(session, ["Alice"]);
+					expect((await api("post", `${session.id}/stop`)).status).to.equal(200);
+					expect(session.id in Sessions).to.be.false;
+					expect((await axios.get(`${base}/${session.id}`, auth)).status).to.equal(404);
+					await until(() => !Alice.c.connected, "Alice to be sent away");
+					expect(Alice.messages.some((m) => m.title === "Draft cancelled")).to.be.true;
+					expect((await api("post", `${session.id}/stop`)).status).to.equal(404);
+				});
+
+				it("an ended session without a delivered log is deleted after its lifetime", async function () {
+					process.env.HOSTED_ENDED_LIFETIME_MS = "200";
+					const { session } = await startedSession("hosted-lifetime", ["Alice", "Bob"]);
+					session.endDraft();
+					await until(() => !session.drafting, "the draft to end");
+					expect((await getLog(session.id)).status).to.equal(200);
+					await until(() => !(session.id in Sessions), "the session to be deleted");
+				});
+
+				it("the lifetime comes from HOSTED_ENDED_LIFETIME_MS, 24 h by default", function () {
+					const day = 24 * 60 * 60 * 1000;
+					expect(endedSessionLifetimeMs({})).to.equal(day);
+					expect(endedSessionLifetimeMs({ HOSTED_ENDED_LIFETIME_MS: "5000" })).to.equal(5000);
+					for (const bad of ["", "0", "-1", "later"])
+						expect(endedSessionLifetimeMs({ HOSTED_ENDED_LIFETIME_MS: bad })).to.equal(day);
+				});
+
+				it("removes an unexpected user", async function () {
+					const session = await hostedSession("hosted-remove-user", ["Alice", "Bob"]);
+					const { Alice, Bob } = await seatEveryone(session);
+					const alice = session.seats[0].userID;
+					const remove = (userID: string) =>
+						axios.delete(`${base}/${session.id}/users/${encodeURIComponent(userID)}`, auth);
+					expect((await remove(alice)).status).to.equal(200);
+					await until(() => !Alice.c.connected, "Alice to be sent away");
+					await until(() => !session.seats[0].connected, "Alice's seat to free up");
+					expect(Alice.messages.some((m) => m.title === "Removed from the draft")).to.be.true;
+					expect(Bob.c.connected).to.be.true;
+					expect((await remove("nobody")).status).to.equal(404);
 				});
 			});
 

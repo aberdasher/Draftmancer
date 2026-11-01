@@ -1,6 +1,7 @@
 import { assert } from "console";
 import { UserID, SessionID } from "./IDTypes.js";
 import type { HostedSeat, HostedSessionSpec } from "./hosted/types.js";
+import { onHostedDraftEnded } from "./hosted/HostedSessions.js";
 import {
 	shuffleArray,
 	getRandom,
@@ -144,6 +145,7 @@ export class Session implements IIndexable {
 	readonly hosted: boolean = false; // Owner-less session controlled through the hosted API (src/hosted).
 	seats: HostedSeat[] = [];
 	hostedSpec?: HostedSessionSpec; // The spec this hosted session was created from.
+	hostedEndedAt: number | null = null; // Epoch ms at which the hosted draft ended.
 	userOrder: Array<string> = [];
 	users: Set<UserID> = new Set();
 	spectators: Set<UserID> = new Set();
@@ -2926,6 +2928,7 @@ export class Session implements IIndexable {
 
 			this.emitToConnectedUsers("endDraft");
 			console.log(`Session ${this.id} draft ended.`);
+			if (this.hosted) onHostedDraftEnded(this);
 		});
 	}
 
