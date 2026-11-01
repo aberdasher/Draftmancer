@@ -13,7 +13,7 @@ The build needs about 3.6 GB of RAM, so build on a workstation, never on the dro
 
 ## Run (myshelter)
 
-Copy this folder to `~/draftmancer-hosted/`, create `hosted.env` there (chmod 600) with
+Copy this folder to `~/draftmancer-hosted/`, create `hosted-secrets` there (chmod 600) with
 `DRAFTBOT_API_TOKEN=<secret>`, then:
 
     DRAFTMANCER_TAG=<tag> docker compose up -d

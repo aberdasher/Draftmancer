@@ -9,7 +9,7 @@
 #   docker exec draftmancer-tailscale tailscale up --hostname=draftmancer
 # and the state volume keeps the node across restarts.
 #
-# Secrets live in hosted.env next to this file (not committed): DRAFTBOT_API_TOKEN=...
+# Secrets live in hosted-secrets next to this file (not committed): DRAFTBOT_API_TOKEN=...
 
 services:
   tailscale:
@@ -36,7 +36,7 @@ services:
     depends_on:
       - tailscale
     env_file:
-      - hosted.env
+      - hosted-secrets
     environment:
       NODE_ENV: production
       # Saved sessions survive a container restart; /home/node is the image user's home.
