@@ -5,7 +5,7 @@ import { Connection, Connections } from "../Connection.js";
 import type { UserID } from "../IDTypes.js";
 import type { DraftLog } from "../DraftLog.js";
 import { convertCubeCobraList } from "../cubeCobraIntegration.js";
-import { isSocketError, Message, MessageError, ToastMessage } from "../Message.js";
+import { isSocketError, MessageError } from "../Message.js";
 import { isRecord, isString, isUnknown } from "../TypeChecks.js";
 import { ReadyState } from "../Session/SessionTypes.js";
 import type { HostedSeat, HostedSessionSpec, HostedStatus } from "./types.js";
@@ -124,9 +124,6 @@ type HostedSocket = Connection["socket"];
 
 export type SeatBinding = { ok: true; userID: UserID } | { ok: false; reason: "seat-in-use" | "no-such-seat" };
 
-/** How long a seat holder has to answer `stillAlive` before the seat is given to a newcomer (as upstream). */
-export const StillAliveTimeoutMs = 3000;
-
 // Seats with a bind in flight, so two newcomers cannot both win the same seat.
 const bindingSeats = new Set<UserID>();
 // Sockets that won a seat, and the session they won it in.
@@ -147,20 +144,13 @@ export function findSeat(seats: HostedSeat[], userName: string): HostedSeat | un
 	return undefined;
 }
 
-function answersStillAlive(socket: HostedSocket): Promise<boolean> {
-	if (!socket.connected) return Promise.resolve(false);
-	return new Promise((resolve) => {
-		const timeout = setTimeout(() => resolve(false), StillAliveTimeoutMs);
-		socket.emit("stillAlive", () => {
-			clearTimeout(timeout);
-			resolve(true);
-		});
-	});
-}
-
 /**
- * Binds a connecting socket to the hosted seat named `userName`. A seat whose holder answers `stillAlive` is in use;
- * a holder that stays silent is disconnected and loses the seat. On success the caller must use the returned userID.
+ * Binds a connecting socket to the hosted seat named `userName`. The newest device wins: a seat already held is
+ * taken from its holder, who is told why and disconnected. A second live tab is most often a stale one -- a phone
+ * in a pocket, a frozen browser -- whose player is reloading because it stopped working; making them find and close
+ * it first is what locks players out. The disconnect is the server's, so the old tab's socket.io does not
+ * reconnect on its own and cannot take the seat back without a deliberate reload.
+ * On success the caller must use the returned userID.
  */
 export async function bindHostedSeat(session: Session, userName: string, socket: HostedSocket): Promise<SeatBinding> {
 	const seat = findSeat(session.seats, userName);
@@ -171,14 +161,10 @@ export async function bindHostedSeat(session: Session, userName: string, socket:
 	try {
 		const holder = Connections[seat.userID];
 		if (holder) {
-			const msg = new Message("Connecting...");
-			msg.allowOutsideClick = false;
-			socket.emit("message", msg);
-			if (await answersStillAlive(holder.socket)) return { ok: false, reason: "seat-in-use" };
+			holder.socket.emit("message", new MessageError(...SeatRefusals["opened-elsewhere"]));
 			holder.socket.disconnect(true);
 			// Let the disconnect handler release the seat and delete the previous Connection.
 			await new Promise((resolve) => process.nextTick(resolve));
-			socket.emit("message", new ToastMessage("Connected"));
 		}
 		if (Connections[seat.userID]) return { ok: false, reason: "seat-in-use" };
 		if (Sessions[session.id] !== session) return { ok: false, reason: "no-such-seat" };
@@ -544,13 +530,18 @@ export function onHostedDraftEnded(session: Session): void {
 	void pushHostedLog(url, session.id, log);
 }
 
-export const SeatRefusals: Record<"seat-in-use" | "no-such-seat", [title: string, text: string]> = {
-	"seat-in-use": [
-		"Seat in use",
-		"Your seat is already connected on another device or tab. Close it there first, or ask the organizer for help.",
-	],
-	"no-such-seat": [
-		"No seat for this name",
-		"This draft has no seat for your name. Open the link you were given for this draft without changing your name.",
-	],
-};
+export const SeatRefusals: Record<"seat-in-use" | "no-such-seat" | "opened-elsewhere", [title: string, text: string]> =
+	{
+		"seat-in-use": [
+			"Seat in use",
+			"Your seat is being opened on another device or tab at this very moment. Reload this page to take it here.",
+		],
+		"no-such-seat": [
+			"No seat for this name",
+			"This draft has no seat for your name. Open the link you were given for this draft without changing your name.",
+		],
+		"opened-elsewhere": [
+			"Opened elsewhere",
+			"This draft was opened on another device or tab, so it moved there. Reload this page to bring it back here.",
+		],
+	};

@@ -240,19 +240,26 @@ describe("Hosted sessions", function () {
 			expect(events.alreadyConnected).to.deep.equal([]);
 		});
 
-		it("refuses a second connection to a connected seat", async function () {
+		it("a second connection takes a connected seat, and the first is told why", async function () {
+			// A live tab elsewhere is most often a stale one (a phone in a pocket, a frozen
+			// browser) whose player is now reloading: the newest device wins, at once.
 			const session = await hostedSession("hosted-seat-in-use", ["Alice", "Bob"]);
 			const seat = session.seats[0];
 			const first = connect(session.id, "Alice", "device-one");
 			await until(() => session.users.has(seat.userID), "Alice to join");
 
 			const second = connect(session.id, "Alice", "device-two");
-			await until(() => second.messages.some((m) => m.icon === "error"), "a refusal");
-			expect(second.messages.find((m) => m.icon === "error")!.title).to.equal("Seat in use");
-			await until(() => !second.c.connected, "the newcomer to be disconnected");
+			await until(
+				() => Connections[seat.userID]?.socket.id === second.c.id,
+				"the newcomer to take the seat",
+				2000
+			);
+			await until(() => session.users.has(seat.userID), "the newcomer to join");
+			await until(() => !first.c.connected, "the first tab to be disconnected");
 
-			expect(first.c.connected).to.be.true;
-			expect(Connections[seat.userID].socket.id).to.equal(first.c.id);
+			expect(second.messages.some((m) => m.icon === "error")).to.be.false;
+			const told = first.messages.find((m) => m.icon === "error");
+			expect(told?.title).to.equal("Opened elsewhere");
 			expect(session.users.size).to.equal(1);
 			expect((await seatStatus(session.id))[0].connected).to.be.true;
 		});
