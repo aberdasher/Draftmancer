@@ -21,8 +21,12 @@ EXPOSE 8080
 
 RUN apk add nginx nginx-mod-http-brotli --no-cache
 
-RUN mkdir -p /run/nginx && \
-    chown -R node:node /var/lib/nginx /var/log/nginx /run/nginx /etc/nginx
+# /home/node/persist is where a deployment mounts its saved sessions
+# (PERSISTENCE_LOCAL_PATH). Created here, owned by the server's user, a fresh
+# volume mounted on it inherits that owner; left for Docker to create, it is
+# root's, and every save fails.
+RUN mkdir -p /run/nginx /home/node/persist && \
+    chown -R node:node /var/lib/nginx /var/log/nginx /run/nginx /etc/nginx /home/node/persist
 
 USER node
 
