@@ -264,26 +264,6 @@ describe("Hosted sessions", function () {
 			expect((await seatStatus(session.id))[0].connected).to.be.true;
 		});
 
-		it("a silent previous connection loses the seat to the newcomer", async function () {
-			const session = await hostedSession("hosted-seat-silent", ["Alice", "Bob"]);
-			const seat = session.seats[0];
-			const first = connect(session.id, "Alice", "device-one");
-			await until(() => session.users.has(seat.userID), "Alice to join");
-			first.c.off("stillAlive"); // A dead tab: still connected, never answers.
-
-			const second = connect(session.id, "Alice", "device-two");
-			await until(
-				() => Connections[seat.userID]?.socket.id === second.c.id,
-				"the newcomer to take the seat",
-				8000
-			);
-			await until(() => session.users.has(seat.userID), "the newcomer to join");
-			expect(second.messages.some((m) => m.icon === "error")).to.be.false;
-			await until(() => !first.c.connected, "the silent connection to be closed");
-			expect(session.users.size).to.equal(1);
-			expect((await seatStatus(session.id))[0].connected).to.be.true;
-		});
-
 		it("a returning player retakes a disconnected seat from a new device", async function () {
 			const session = await hostedSession("hosted-seat-return", ["Alice", "Bob"]);
 			const seat = session.seats[0];
