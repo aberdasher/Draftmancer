@@ -1,5 +1,7 @@
 import { assert } from "console";
 import { UserID, SessionID } from "./IDTypes.js";
+import type { HostedSeat, HostedSessionSpec } from "./hosted/types.js";
+import { onHostedDraftEnded } from "./hosted/HostedSessions.js";
 import {
 	shuffleArray,
 	getRandom,
@@ -140,6 +142,12 @@ export class Session implements IIndexable {
 	id: SessionID;
 	owner?: UserID;
 	readonly managed: boolean = false;
+	readonly hosted: boolean = false; // Owner-less session controlled through the hosted API (src/hosted).
+	seats: HostedSeat[] = [];
+	hostedSpec?: HostedSessionSpec; // The spec this hosted session was created from.
+	hostedCreatedAt: number | null = null; // Epoch ms at which the hosted API created this session.
+	hostedEndedAt: number | null = null; // Epoch ms at which the hosted draft ended.
+	hostedStoppedAt: number | null = null; // Epoch ms at which the hosted API stopped the draft before it finished.
 	userOrder: Array<string> = [];
 	users: Set<UserID> = new Set();
 	spectators: Set<UserID> = new Set();
@@ -208,11 +216,12 @@ export class Session implements IIndexable {
 	constructor(
 		id: SessionID,
 		owner: UserID | undefined,
-		options: { managed?: boolean } & Record<keyof typeof SessionsSettingsProps, unknown> = {}
+		options: { managed?: boolean; hosted?: boolean } & Record<keyof typeof SessionsSettingsProps, unknown> = {}
 	) {
 		this.id = id;
 		this.owner = owner;
 		if (options.managed) this.managed = options.managed;
+		if (options.hosted) this.hosted = options.hosted;
 
 		// Validate and set session settings
 		for (const p in options)
@@ -383,10 +392,12 @@ export class Session implements IIndexable {
 		this.users.delete(userID);
 
 		// User was the owner of the session, transfer ownership to the first available users.
-		if (this.owner === userID) this.owner = this.users.values().next().value;
+		// Hosted sessions never have an owner: the hosted API controls them.
+		if (this.owner === userID && !this.hosted) this.owner = this.users.values().next().value;
 
 		if (this.drafting) {
-			if (this.managed) {
+			// Hosted sessions wait for disconnected players instead of replacing them by a bot.
+			if (this.managed && !this.hosted) {
 				// If user is still disconnected after a timeout, replace them by a bot.
 				const timeoutSeconds = 30;
 				setTimeout(() => {
@@ -2919,6 +2930,7 @@ export class Session implements IIndexable {
 
 			this.emitToConnectedUsers("endDraft");
 			console.log(`Session ${this.id} draft ended.`);
+			if (this.hosted) onHostedDraftEnded(this);
 		});
 	}
 

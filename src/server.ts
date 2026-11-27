@@ -24,7 +24,14 @@ import {
 	MessageError,
 } from "./Message.js";
 import { Constants } from "./Constants.js";
-import { InactiveConnections, InactiveSessions, restoreSession, getPoDSession, copyPODProps } from "./Persistence.js";
+import {
+	InactiveConnections,
+	InactiveSessions,
+	restoreSession,
+	getPoDSession,
+	copyPODProps,
+	restoreHostedSessions,
+} from "./Persistence.js";
 import { Connection, Connections } from "./Connection.js";
 import { DistributionMode, DraftLogRecipients, ReadyState } from "./Session/SessionTypes";
 import { Session, Sessions, getPublicSessionData } from "./Session.js";
@@ -76,6 +83,15 @@ import { CardPool } from "./CardPool.js";
 import { convertCubeCobraList, DraftFormat, importFormat as convertDraftFormat } from "./cubeCobraIntegration.js";
 import { setBatchWindow } from "./bots/CubeCobraBots.js";
 import { MinesweeperDraftState } from "./MinesweeperDraft.js";
+import { registerHostedRoutes } from "./hosted/HostedAPI.js";
+import {
+	bindHostedSeat,
+	holdsSeat,
+	isSeatUserID,
+	recordSeatReady,
+	SeatRefusals,
+	setSeatConnected,
+} from "./hosted/HostedSessions.js";
 
 if (process.env.NODE_ENV === "production") MTGOAPIInit();
 
@@ -340,6 +356,7 @@ function chatMessage(
 
 function setReady(userID: UserID, sessionID: SessionID, readyState: ReadyState) {
 	if (!isString(readyState)) return;
+	if (Sessions[sessionID].hosted) recordSeatReady(Sessions[sessionID], userID, readyState);
 	Sessions[sessionID].forUsers((user) => Connections[user]?.socket.emit("setReady", userID, readyState));
 }
 
@@ -1578,6 +1595,24 @@ io.on("connection", async function (socket) {
 			`${query.userName} [${query.userID}] connected. (${Object.keys(Connections).length + 1} players online)`
 		);
 
+	// Hosted sessions: the seat named by userName, not the browser's stored ID, is the identity.
+	const hostedSession = isString(query.sessionID) ? Sessions[query.sessionID] : undefined;
+	if (hostedSession?.hosted) {
+		const binding = await bindHostedSeat(hostedSession, query.userName, socket);
+		if (!binding.ok) {
+			socket.emit("message", new MessageError(...SeatRefusals[binding.reason]));
+			socket.disconnect(true);
+			return;
+		}
+		if (!socket.connected) return;
+		query.userID = binding.userID;
+		socket.emit("hostedSeat", binding.userID);
+	} else if (isSeatUserID(query.userID)) {
+		// A seat ID from a session that is gone (e.g. a reload after it was deleted): silently swap it for a fresh one.
+		query.userID = uuidv1();
+		socket.emit("hostedSeat", query.userID);
+	}
+
 	if (query.userID in Connections) {
 		console.log(`${query.userName} [${query.userID}] already connected.`);
 		// For some reason sockets doesn't always cleanly disconnects.
@@ -1948,6 +1983,14 @@ function joinSession(sessionID: SessionID, userID: UserID, defaultSessionSetting
 
 	if (sessionID in Sessions) {
 		const sess = Sessions[sessionID];
+		if (sess.hosted) {
+			if (!holdsSeat(sess, userID)) return refuse(`This session (${sessionID}) only admits its listed players.`);
+			if (!sess.drafting) addUserToSession(userID, sessionID);
+			else if (userID in sess.disconnectedUsers) sess.reconnectUser(userID);
+			else if (!sess.users.has(userID)) return refuse(`This session (${sessionID}) is currently drafting.`);
+			setSeatConnected(sess, userID, true);
+			return;
+		}
 		// User was the owner, but not playing
 		if (userID === sess.owner && !sess.ownerIsPlayer) {
 			sess.reconnectOwner(userID);
@@ -2047,12 +2090,18 @@ function removeUserFromSession(sessionID: SessionID, userID: UserID) {
 		const sess = Sessions[sessionID];
 		if (sess.users.has(userID) || userID in sess.disconnectedUsers) {
 			sess.remUser(userID);
+			if (sess.hosted) setSeatConnected(sess, userID, false);
 			if (sess.isPublic) updatePublicSession(sessionID);
 
 			if (Connections[userID]) Connections[userID].sessionID = undefined;
 
 			//                           Keep session alive if the owner wasn't a player and is still connected.
-			if (sess.users.size === 0 && (sess.ownerIsPlayer || !(sess.owner && sess.owner in Connections))) {
+			// Hosted sessions outlive their players: their seats wait for them.
+			if (
+				sess.users.size === 0 &&
+				!sess.hosted &&
+				(sess.ownerIsPlayer || !(sess.owner && sess.owner in Connections))
+			) {
 				// If a game was going, we'll keep the session around for a while in case a player reconnects
 				// (mostly useful in case of disconnection during a single player game)
 				// Also keep it around if draft logs weren't unlocked, and scheduled to be automatically unlocked.
@@ -2361,7 +2410,12 @@ app.post("/setBotBatchWindow", requirePOSTAPIKey, (req, res) => {
 	}
 });
 
+registerHostedRoutes(app);
+
 Promise.all([InactiveConnections, InactiveSessions]).then(() => {
+	// Here, not in Persistence.ts's own load: restoring constructs Sessions, and Session.ts and Persistence.ts import
+	// each other, so Session is only certain to be initialised once every module has been evaluated.
+	restoreHostedSessions();
 	httpServer.listen(DraftmancerPort, () => {
 		console.log(`Listening on port ${DraftmancerPort} (ready in ${process.uptime().toFixed(2)}s)`);
 	});

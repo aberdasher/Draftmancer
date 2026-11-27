@@ -40,11 +40,15 @@ import { sendLog } from "./BotTrainingAPI.js";
 import { deserializeBracket } from "./BracketSerialization.js";
 import { hasProperty, isString } from "./TypeChecks.js";
 import { DefaultTiebreakers } from "./SilentAuctionDraftTiebreakers.js";
+import { onHostedSessionRestored, setDeletionPersister } from "./hosted/HostedSessions.js";
 
 const PersistenceLocalPath = process.env.PERSISTENCE_LOCAL_PATH ?? ".";
 const LocalPersitenceDirectory = "tmp";
-const LocalConnectionsFile = path.join(PersistenceLocalPath, LocalPersitenceDirectory, "/connections.json");
-const LocalSessionsFile = path.join(PersistenceLocalPath, LocalPersitenceDirectory, "/sessions.json");
+const persistenceFiles = (dir: string) => ({
+	directory: path.join(dir, LocalPersitenceDirectory),
+	connections: path.join(dir, LocalPersitenceDirectory, "/connections.json"),
+	sessions: path.join(dir, LocalPersitenceDirectory, "/sessions.json"),
+});
 
 export let InactiveSessions: Record<SessionID, any> = {};
 export let InactiveConnections: Record<UserID, ReturnType<typeof getPODConnection>> = {};
@@ -81,7 +85,7 @@ function restoreBot(bot: unknown): IBot | undefined {
 	return undefined;
 }
 
-async function loadSavedConnections() {
+async function loadSavedConnections(LocalConnectionsFile: string) {
 	const InactiveConnections: Record<UserID, ReturnType<typeof getPODConnection>> = {};
 
 	if (fs.existsSync(LocalConnectionsFile)) {
@@ -100,7 +104,7 @@ async function loadSavedConnections() {
 	return InactiveConnections;
 }
 
-async function loadSavedSessions() {
+async function loadSavedSessions(LocalSessionsFile: string) {
 	const InactiveSessions: Record<SessionID, unknown> = {};
 
 	if (fs.existsSync(LocalSessionsFile)) {
@@ -119,7 +123,7 @@ async function loadSavedSessions() {
 	return InactiveSessions;
 }
 
-export function restoreSession(s: any, owner: UserID) {
+export function restoreSession(s: any, owner: UserID | undefined) {
 	const r = new Session(s.id, owner);
 	for (const prop of Object.getOwnPropertyNames(s).filter(
 		(p) => !["draftState", "owner", "spectators"].includes(p)
@@ -240,7 +244,7 @@ export function getPoDSession(s: Session) {
 	const PoDSession: Record<string, any> = {};
 
 	for (const prop of Object.getOwnPropertyNames(s).filter(
-		(p) => !["users", "spectators", "draftState", "sendDecklogTimeout"].includes(p)
+		(p) => !["users", "spectators", "draftState", "sendDecklogTimeout", "stableLogTimeout"].includes(p)
 	)) {
 		if (!((s as IIndexable)[prop] instanceof Function)) PoDSession[prop] = (s as IIndexable)[prop];
 	}
@@ -257,8 +261,9 @@ export function getPoDSession(s: Session) {
 
 			if (s.draftState instanceof DraftState) {
 				PoDSession.draftState.pendingReviewTimeout = null;
-				const players = {};
-				copyPODProps(s.draftState.players, players);
+				// Copy each player too: the fixes below must not reach the live draft (dumps also run periodically).
+				const players: Record<UserID, unknown> = {};
+				for (const userID in s.draftState.players) players[userID] = { ...s.draftState.players[userID] };
 				PoDSession.draftState.players = players;
 
 				for (const userID in s.draftState.players) {
@@ -275,7 +280,29 @@ export function getPoDSession(s: Session) {
 	return PoDSession;
 }
 
-function dumpToDisk(exitOnCompletion = false) {
+/** Writes `file` aside then renames it over the previous copy, so a crash or a failed write keeps the last good one. */
+function writeAside(file: string, fill: (write: (data: string) => void) => void) {
+	const partial = `${file}.partial`;
+	const fd = fs.openSync(partial, "w");
+	try {
+		fill((data) => dumpWriter(fd, data));
+	} finally {
+		// Always closed: the dump runs periodically, and a persistent disk fault must not leak a descriptor a tick.
+		fs.closeSync(fd);
+	}
+	fs.renameSync(partial, file);
+}
+
+let dumpWriter: (fd: number, data: string) => void = (fd, data) => void fs.writeSync(fd, data);
+
+/** Replaces the writer the dump uses (tests: a failing disk); call with no argument to restore the default. */
+export const setDumpWriter = TestingOnly((writer?: (fd: number, data: string) => void) => {
+	dumpWriter = writer ?? ((fd, data) => void fs.writeSync(fd, data));
+});
+
+/** Saves every Connection and Session under `<dir>/tmp`; `exitOnCompletion` is the shutdown path. */
+export function dumpToDisk({ exitOnCompletion = false, dir = PersistenceLocalPath } = {}) {
+	const { directory, connections: LocalConnectionsFile, sessions: LocalSessionsFile } = persistenceFiles(dir);
 	// Avoid user interaction during saving
 	// (Disconnecting the socket would be better, but explicitly
 	// disconnecting socket prevents their automatic reconnection)
@@ -287,55 +314,58 @@ function dumpToDisk(exitOnCompletion = false) {
 		for (const userID in Connections) Connections[userID].socket.emit("message", msg);
 	}
 
-	if (!fs.existsSync(path.join(PersistenceLocalPath, LocalPersitenceDirectory)))
-		fs.mkdirSync(path.join(PersistenceLocalPath, LocalPersitenceDirectory), { recursive: true });
+	if (!fs.existsSync(directory)) fs.mkdirSync(directory, { recursive: true });
+	// Only the shutdown dump reports progress; the periodic one would flood the logs.
+	const log = exitOnCompletion ? console.log : () => {};
 
 	{
-		console.log(`Saving ${Object.keys(Connections).length} Connections to disk (${LocalConnectionsFile})...`);
-		const connectionsFile = fs.openSync(LocalConnectionsFile, "w");
-		fs.writeSync(connectionsFile, "[\n");
-		let firstConnection = true;
-		for (const userID in Connections) {
-			if (!firstConnection) fs.writeSync(connectionsFile, ",\n");
-			else firstConnection = false;
-			fs.writeSync(connectionsFile, JSON.stringify(getPODConnection(Connections[userID])));
-		}
-		fs.writeSync(connectionsFile, "\n]\n");
-		fs.closeSync(connectionsFile);
-		console.log("  [+] Connections successfully saved to disk.");
+		log(`Saving ${Object.keys(Connections).length} Connections to disk (${LocalConnectionsFile})...`);
+		writeAside(LocalConnectionsFile, (write) => {
+			write("[\n");
+			let firstConnection = true;
+			for (const userID in Connections) {
+				if (!firstConnection) write(",\n");
+				else firstConnection = false;
+				write(JSON.stringify(getPODConnection(Connections[userID])));
+			}
+			write("\n]\n");
+		});
+		log("  [+] Connections successfully saved to disk.");
 	}
 	{
-		console.log(`Saving ${Object.keys(Sessions).length} Sessions to disk (${LocalSessionsFile})...`);
-		const sessionsFile = fs.openSync(LocalSessionsFile, "w");
-		fs.writeSync(sessionsFile, "[\n");
-		let firstSession = true;
-		// Keep inactive Rotisserie sessions alive, as they can be ran asynchronously over a longer period
-		for (const sessionID in InactiveSessions) {
-			if (InactiveSessions[sessionID].draftState?.type === "rotisserie") {
-				// Skip if it is older than ~6 months
-				if (
-					InactiveSessions[sessionID].draftLog.time &&
-					InactiveSessions[sessionID].draftLog.time < Date.now() - 1000 * 60 * 60 * 24 * 30 * 6
-				)
+		log(`Saving ${Object.keys(Sessions).length} Sessions to disk (${LocalSessionsFile})...`);
+		writeAside(LocalSessionsFile, (write) => {
+			write("[\n");
+			let firstSession = true;
+			// Keep inactive Rotisserie sessions alive, as they can be ran asynchronously over a longer period
+			for (const sessionID in InactiveSessions) {
+				if (InactiveSessions[sessionID].draftState?.type === "rotisserie") {
+					// Skip if it is older than ~6 months
+					if (
+						InactiveSessions[sessionID].draftLog.time &&
+						InactiveSessions[sessionID].draftLog.time < Date.now() - 1000 * 60 * 60 * 24 * 30 * 6
+					)
+						continue;
+					if (!firstSession) write(",\n");
+					else firstSession = false;
+					write(JSON.stringify(InactiveSessions[sessionID]));
+				}
+			}
+			for (const sessionID in Sessions) {
+				let serialized: string;
+				try {
+					serialized = JSON.stringify(getPoDSession(Sessions[sessionID]));
+				} catch (e) {
+					console.error(`Error while saving session '${sessionID}': `, e);
 					continue;
-				if (!firstSession) fs.writeSync(sessionsFile, ",\n");
+				}
+				if (!firstSession) write(",\n");
 				else firstSession = false;
-				fs.writeSync(sessionsFile, JSON.stringify(InactiveSessions[sessionID]));
+				write(serialized);
 			}
-		}
-		for (const sessionID in Sessions) {
-			try {
-				const serialized = JSON.stringify(getPoDSession(Sessions[sessionID]));
-				if (!firstSession) fs.writeSync(sessionsFile, ",\n");
-				else firstSession = false;
-				fs.writeSync(sessionsFile, serialized);
-			} catch (e) {
-				console.error(`Error while saving session '${sessionID}': `, e);
-			}
-		}
-		fs.writeSync(sessionsFile, "\n]\n");
-		fs.closeSync(sessionsFile);
-		console.log("  [+] Sessions successfully saved to disk.");
+			write("\n]\n");
+		});
+		log("  [+] Sessions successfully saved to disk.");
 	}
 	if (exitOnCompletion) process.exit(0);
 }
@@ -404,13 +434,73 @@ export function logSession(type: string, session: Session) {
 	MixInstance.track(type === "" ? "DefaultEvent" : type, mixdata);
 }
 
+/**
+ * Hosted sessions come back live at once, gathering or drafting, so the hosted API finds them and players can retake
+ * their seats. Nobody is connected after a restart, and a pending ready check is gone.
+ * Call it once loading is done, never from this module's own top-level load: it constructs Sessions, and Session.ts
+ * and this module import each other, so Session may not be initialised yet while this module evaluates.
+ */
+export function restoreHostedSessions() {
+	for (const sessionID in InactiveSessions) {
+		const saved = InactiveSessions[sessionID];
+		if (!saved.hosted) continue;
+		// A live session already owns the ID: the saved copy is stale.
+		if (sessionID in Sessions) {
+			delete InactiveSessions[sessionID];
+			continue;
+		}
+		try {
+			const session = restoreSession(saved, undefined);
+			const now = Date.now();
+			for (const seat of session.seats) {
+				if (seat.connected) seat.disconnectedSince = now;
+				seat.connected = false;
+				seat.ready = "unknown";
+			}
+			// Players join again as they reconnect; only a drafting session keeps its seating.
+			if (!session.drafting) session.userOrder = [];
+			Sessions[sessionID] = session;
+			delete InactiveSessions[sessionID];
+			onHostedSessionRestored(session);
+		} catch (err) {
+			console.error(`Error restoring hosted session '${sessionID}': `, err);
+		}
+	}
+}
+
+/** Loads the state saved under `<dir>/tmp` into InactiveConnections and InactiveSessions; see restoreHostedSessions. */
+export async function loadFromDisk(dir = PersistenceLocalPath) {
+	const files = persistenceFiles(dir);
+	InactiveConnections = await loadSavedConnections(files.connections);
+	InactiveSessions = await loadSavedSessions(files.sessions);
+}
+
+/** HOSTED_DUMP_INTERVAL_MS when it is a positive number of milliseconds, 30 s otherwise. */
+export function dumpIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
+	const ms = Number(env.HOSTED_DUMP_INTERVAL_MS);
+	return env.HOSTED_DUMP_INTERVAL_MS && Number.isFinite(ms) && ms > 0 ? ms : 30000;
+}
+
+/** Dumps to disk every `intervalMs`, so a crash loses at most that much; never keeps the process alive. */
+export function startPeriodicDump(intervalMs: number, dir = PersistenceLocalPath): NodeJS.Timeout {
+	const timer = setInterval(() => {
+		try {
+			dumpToDisk({ dir });
+		} catch (err) {
+			console.error("Error during periodic dump: ", err);
+		}
+	}, intervalMs);
+	timer.unref();
+	return timer;
+}
+
 // Dumps and reloads inactive sessions, ONLY for testing purposes.
 export const simulateRestart = TestingOnly(async () => {
 	dumpToDisk();
 	clearConnections();
 	clearSessions();
-	InactiveConnections = await loadSavedConnections();
-	InactiveSessions = await loadSavedSessions();
+	await loadFromDisk();
+	restoreHostedSessions();
 });
 
 if (!DisablePersistence) {
@@ -433,7 +523,7 @@ if (!DisablePersistence) {
 			console.error("[-] dumpToDisk did not finish in time after SIGTERM, force quitting...");
 			process.exit(0);
 		}, 30000);
-		dumpToDisk(true);
+		dumpToDisk({ exitOnCompletion: true });
 	});
 
 	process.on("SIGINT", () => {
@@ -443,7 +533,7 @@ if (!DisablePersistence) {
 			console.error("[-] dumpToDisk did not finish in time after SIGINT, force quitting...");
 			process.exit(0);
 		}, 30000);
-		dumpToDisk(true);
+		dumpToDisk({ exitOnCompletion: true });
 	});
 
 	process.on("uncaughtException", (err) => {
@@ -454,13 +544,16 @@ if (!DisablePersistence) {
 			console.error("[-] dumpToDisk did not finish in time after Uncaught Exception, force quitting...");
 			process.exit(1);
 		}, 30000);
-		dumpToDisk(true);
+		dumpToDisk({ exitOnCompletion: true });
 	});
 
 	try {
-		InactiveConnections = await loadSavedConnections();
-		InactiveSessions = await loadSavedSessions();
+		await loadFromDisk();
 	} catch (err) {
 		console.error("Error loading persistence data: ", err);
 	}
+
+	startPeriodicDump(dumpIntervalMs());
+	// A deleted hosted session must not come back if the server crashes before the next periodic dump.
+	setDeletionPersister(() => dumpToDisk());
 }
