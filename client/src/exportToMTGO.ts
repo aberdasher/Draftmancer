@@ -5,6 +5,7 @@ import Constants from "../../src/Constants";
 import { Alert, fireToast, loadingToast } from "./alerts";
 import { download, escapeHTML, wait } from "./helper";
 import { Card, CardColor } from "@/CardTypes.js";
+import { printingWithMTGOID } from "./mtgoPrinting";
 
 async function requestMTGOIDs(cards: Card[]): Promise<boolean> {
 	const maxRetries = 3;
@@ -101,11 +102,7 @@ export async function exportToMTGO(
 					{ timeout: 5000 }
 				);
 				if (allPrintings.status === 200 && allPrintings.data.object === "list") {
-					for (const candidate of allPrintings.data.data)
-						if (candidate.mtgo_id) {
-							scryfall_card = candidate as ScryfallCard;
-							break;
-						}
+					scryfall_card = printingWithMTGOID(card.name, allPrintings.data.data as ScryfallCard[]) ?? null;
 				} else {
 					console.error(
 						`exportToMTGO: Unexpected response from Scryfall API for card '${card.name}'. Response:`,
